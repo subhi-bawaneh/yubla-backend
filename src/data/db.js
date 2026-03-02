@@ -3,16 +3,48 @@ import { hashPassword, verifyPassword } from '../utils/security.js';
 
 const { Pool } = pg;
 
-const databaseUrl = String(process.env.DATABASE_URL || '').trim();
-if (!databaseUrl) {
+const readEnv = (...keys) => {
+  for (const key of keys) {
+    const value = String(process.env[key] || '').trim();
+    if (value) return value;
+  }
+  return '';
+};
+
+const parsePort = (value, fallback = 5432) => {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const databaseUrl = readEnv('DATABASE_URL', 'DATABASE_PRIVATE_URL', 'POSTGRES_URL', 'POSTGRES_PRISMA_URL');
+const pgHost = readEnv('PGHOST', 'POSTGRES_HOST');
+const pgUser = readEnv('PGUSER', 'POSTGRES_USER');
+const pgPassword = readEnv('PGPASSWORD', 'POSTGRES_PASSWORD');
+const pgDatabase = readEnv('PGDATABASE', 'POSTGRES_DB');
+const pgPort = parsePort(readEnv('PGPORT', 'POSTGRES_PORT'), 5432);
+
+const hasPgParts = pgHost && pgUser && pgDatabase;
+const poolConnectionConfig = databaseUrl
+  ? { connectionString: databaseUrl }
+  : hasPgParts
+    ? {
+        host: pgHost,
+        port: pgPort,
+        user: pgUser,
+        password: pgPassword,
+        database: pgDatabase
+      }
+    : null;
+
+if (!poolConnectionConfig) {
   throw new Error(
-    'DATABASE_URL is required. For Supabase on IPv4-only networks, use the pooler URL format on port 6543.'
+    'Database config missing. Set DATABASE_URL (recommended) or PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE.'
   );
 }
 
 // Supabase PostgreSQL connection
 const pool = new Pool({
-  connectionString: databaseUrl,
+  ...poolConnectionConfig,
   ssl: {
     rejectUnauthorized: false
   },
