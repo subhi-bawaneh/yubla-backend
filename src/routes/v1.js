@@ -73,9 +73,22 @@ const computeLevel = (recall, understand, hots, maxRecall, maxUnderstand, maxHot
 };
 
 const getBearerToken = (req) => {
-  const header = req.headers.authorization || '';
-  if (!header.startsWith('Bearer ')) return null;
-  return header.slice(7).trim();
+  const authHeader = cleanText(req.headers.authorization);
+  if (authHeader) {
+    if (authHeader.toLowerCase().startsWith('bearer ')) {
+      return authHeader.slice(7).trim();
+    }
+    if (!authHeader.includes(' ')) return authHeader;
+  }
+
+  const fallbackHeader =
+    cleanText(req.headers['x-access-token']) ||
+    cleanText(req.headers['x-auth-token']) ||
+    cleanText(req.headers.token);
+  if (fallbackHeader) return fallbackHeader;
+
+  const queryToken = cleanText(req.query?.accessToken || req.query?.token);
+  return queryToken || null;
 };
 
 const authRequired = async (req, res, next) => {
@@ -177,6 +190,7 @@ router.post('/auth/login', async (req, res) => {
   return res.json({
     ok: true,
     accessToken: session.id,
+    token: session.id,
     expiresAt: session.expiresAt,
     user: sanitizeUser(user),
     tenant
