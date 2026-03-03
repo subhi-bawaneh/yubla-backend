@@ -36,6 +36,21 @@ import {
 import { createSession, hashPassword, isSessionExpired, verifyPassword } from '../utils/security.js';
 
 const router = Router();
+const asyncHandler = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+const ROUTER_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head'];
+
+// Ensure rejected promises in async route handlers are forwarded to Express error middleware.
+for (const method of ROUTER_METHODS) {
+  const original = router[method].bind(router);
+  router[method] = (path, ...handlers) => {
+    const wrappedHandlers = handlers.map((handler) =>
+      typeof handler === 'function' && handler.constructor?.name === 'AsyncFunction'
+        ? asyncHandler(handler)
+        : handler
+    );
+    return original(path, ...wrappedHandlers);
+  };
+}
 
 const sanitizeUser = (user, options = {}) => ({
   id: user.id,
@@ -127,7 +142,7 @@ router.get('/health', async (_req, res) => {
 });
 
 router.get('/public/tenants', async (_req, res) => {
-  const tenants = await listTenantsDb()
+  const tenants = (await listTenantsDb())
     .filter((tenant) => tenant.active)
     .map((tenant) => ({ id: tenant.id, code: tenant.code, name: tenant.name, city: tenant.city }));
   res.json({ ok: true, tenants });

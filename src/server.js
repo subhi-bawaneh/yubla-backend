@@ -56,6 +56,16 @@ app.get('/health', (_req, res) => {
 
 app.use('/api', apiRouter);
 app.use('/api/v1', v1Router);
+app.use((error, _req, res, next) => {
+  if (!error) return next();
+  if (res.headersSent) return next(error);
+  if (error?.message === 'Not allowed by CORS') {
+    return res.status(403).json({ ok: false, error: 'Not allowed by CORS' });
+  }
+
+  console.error('Unhandled request error:', error);
+  return res.status(500).json({ ok: false, error: 'Internal server error' });
+});
 
 const toPort = (value, fallback) => {
   const parsed = Number.parseInt(String(value || ''), 10);
