@@ -488,12 +488,13 @@ router.post('/admin/students/replace', authRequired, rolesAllowed('school_admin'
   return res.json({ ok: true, replaced });
 });
 
-router.get('/lookups', authRequired, rolesAllowed('school_admin', 'teacher'), async (req, res) => {
+router.get('/lookups', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin'), async (req, res) => {
   const user = await findUserByIdDb(req.auth.userId);
+  const tenantId = req.auth.role === 'super_admin' ? cleanText(req.query.tenantId) || null : req.auth.tenantId;
   const lookups =
     req.auth.role === 'teacher'
-      ? await buildTeacherScopedLookupsDb(req.auth.tenantId, user)
-      : await getTenantLookupsDb(req.auth.tenantId);
+      ? await buildTeacherScopedLookupsDb(tenantId, user)
+      : await getTenantLookupsDb(tenantId);
   if (!lookups) return res.status(404).json({ ok: false, error: 'Tenant not found' });
   return res.json({ ok: true, ...lookups });
 });
