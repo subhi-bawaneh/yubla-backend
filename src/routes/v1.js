@@ -243,7 +243,8 @@ router.patch('/auth/account', authRequired, async (req, res) => {
 });
 
 router.get('/super/overview', authRequired, rolesAllowed('super_admin'), async (_req, res) => {
-  res.json({ ok: true, stats: getSystemStatsDb() });
+  const stats = await getSystemStatsDb();
+  res.json({ ok: true, stats });
 });
 
 router.get('/super/tenants', authRequired, rolesAllowed('super_admin'), async (req, res) => {
@@ -251,7 +252,7 @@ router.get('/super/tenants', authRequired, rolesAllowed('super_admin'), async (r
   const page = Math.max(1, toNumber(req.query.page, 1));
   const pageSize = Math.min(200, Math.max(1, toNumber(req.query.pageSize, 20)));
 
-  const rows = await listTenantsDb().filter((tenant) => {
+  const rows = (await listTenantsDb()).filter((tenant) => {
     if (!search) return true;
     return (
       tenant.name.toLowerCase().includes(search) ||
@@ -318,7 +319,7 @@ router.get('/super/users', authRequired, rolesAllowed('super_admin'), async (req
   const tenantId = cleanText(req.query.tenantId) || null;
   const role = cleanText(req.query.role) || null;
   const search = cleanText(req.query.search) || '';
-  const users = await listUsersDb({ tenantId, role, search }).map((user) => sanitizeUser(user, { includePassword: true }));
+  const users = (await listUsersDb({ tenantId, role, search })).map((user) => sanitizeUser(user, { includePassword: true }));
   res.json({ ok: true, users });
 });
 
