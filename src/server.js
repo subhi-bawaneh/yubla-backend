@@ -6,30 +6,48 @@ import v1Router from './routes/v1.js';
 import { initDb } from './data/db.js';
 
 const app = express();
-const frontendOrigin = String(process.env.FRONTEND_ORIGIN || '').trim();
-const allowedOrigins = frontendOrigin 
-  ? frontendOrigin.split(',').map(o => o.trim())
-  : ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://yubla-frontend.vercel.app'];
+const normalizeOrigin = (value) => String(value || '').trim().replace(/\/+$/, '').toLowerCase();
+const parseOriginList = (value) =>
+  String(value || '')
+    .split(',')
+    .map((origin) => origin.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean);
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps or curl)
-      if (!origin) return callback(null, true);
-      
-      // Allow all origins if FRONTEND_ORIGIN is not set or is '*'
-      if (!frontendOrigin || frontendOrigin === '*') return callback(null, true);
-      
-      // Check if origin is in allowed list
-      if (allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'));
-      }
-    },
-    credentials: true
-  })
+const configuredOrigins = parseOriginList(process.env.FRONTEND_ORIGIN);
+const defaultOrigins =
+  process.env.NODE_ENV === 'production'
+    ? ['https://yubla-frontend.vercel.app']
+    : ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://yubla-frontend.vercel.app'];
+const allowAnyOrigin = configuredOrigins.includes('*');
+const wildcardOriginPatterns = configuredOrigins
+  .map(normalizeOrigin)
+  .filter((origin) => origin.includes('*'))
+  .map((origin) => new RegExp(`^${origin.split('*').map(escapeRegex).join('.*')}$`, 'i'));
+const allowedOrigins = new Set(
+  [...defaultOrigins, ...configuredOrigins]
+    .map(normalizeOrigin)
+    .filter((origin) => origin && origin !== '*')
 );
+const isOriginAllowed = (origin) => {
+  const normalizedOrigin = normalizeOrigin(origin);
+  if (allowedOrigins.has(normalizedOrigin)) return true;
+  return wildcardOriginPatterns.some((pattern) => pattern.test(normalizedOrigin));
+};
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    if (allowAnyOrigin || isOriginAllowed(origin)) return callback(null, true);
+    console.warn(`[CORS] Blocked origin: ${origin}`);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '1mb' }));
 
 app.get('/health', (_req, res) => {

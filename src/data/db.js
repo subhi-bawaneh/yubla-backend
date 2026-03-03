@@ -11,12 +11,31 @@ const readEnv = (...keys) => {
   return '';
 };
 
+const stripWrappingQuotes = (value) => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const hasDoubleQuotes = text.startsWith('"') && text.endsWith('"');
+  const hasSingleQuotes = text.startsWith("'") && text.endsWith("'");
+  return hasDoubleQuotes || hasSingleQuotes ? text.slice(1, -1).trim() : text;
+};
+
+const isValidPostgresUrl = (value) => {
+  if (!value) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'postgres:' || parsed.protocol === 'postgresql:';
+  } catch {
+    return false;
+  }
+};
+
 const parsePort = (value, fallback = 5432) => {
   const parsed = Number.parseInt(String(value || ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 };
 
-const databaseUrl = readEnv('DATABASE_URL', 'DATABASE_PRIVATE_URL', 'POSTGRES_URL', 'POSTGRES_PRISMA_URL');
+const rawDatabaseUrl = readEnv('DATABASE_URL', 'DATABASE_PRIVATE_URL', 'POSTGRES_URL', 'POSTGRES_PRISMA_URL');
+const databaseUrl = stripWrappingQuotes(rawDatabaseUrl);
 const pgHost = readEnv('PGHOST', 'POSTGRES_HOST');
 const pgUser = readEnv('PGUSER', 'POSTGRES_USER');
 const pgPassword = readEnv('PGPASSWORD', 'POSTGRES_PASSWORD');
@@ -24,7 +43,12 @@ const pgDatabase = readEnv('PGDATABASE', 'POSTGRES_DB');
 const pgPort = parsePort(readEnv('PGPORT', 'POSTGRES_PORT'), 5432);
 
 const hasPgParts = pgHost && pgUser && pgDatabase;
-const poolConnectionConfig = databaseUrl
+const hasValidDatabaseUrl = isValidPostgresUrl(databaseUrl);
+if (rawDatabaseUrl && !hasValidDatabaseUrl && hasPgParts) {
+  console.warn('DATABASE_URL is invalid; falling back to PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE.');
+}
+
+const poolConnectionConfig = hasValidDatabaseUrl
   ? { connectionString: databaseUrl }
   : hasPgParts
     ? {
@@ -38,7 +62,7 @@ const poolConnectionConfig = databaseUrl
 
 if (!poolConnectionConfig) {
   throw new Error(
-    'Database config missing. Set DATABASE_URL (recommended) or PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE.'
+    'Database config missing or invalid. Set DATABASE_URL as a valid postgres:// URL (no wrapping quotes) or set PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE.'
   );
 }
 
