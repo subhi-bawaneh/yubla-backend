@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import {
-  addTenantSubmissionDb,
+  addTenantSubmissionsBatchDb,
   bootstrapTenantDemoDb,
   buildTeacherScopedLookupsDb,
   canTeacherAccessDb,
@@ -456,7 +456,7 @@ router.post('/super/system/reset-schools', authRequired, rolesAllowed('super_adm
   if (req.body?.confirm !== true) {
     return res.status(400).json({ ok: false, error: 'Confirmation is required' });
   }
-  const report = await purgeSchoolDataDb({ keepSessionId: req.auth.id });
+  const report = await purgeSchoolDataDb({ keepSessionId: req.auth.id, includeCounts: false });
   return res.json({ ok: true, report });
 });
 
@@ -488,7 +488,7 @@ router.post('/super/import/students', authRequired, rolesAllowed('super_admin'),
 });
 
 router.get('/admin/users', authRequired, rolesAllowed('school_admin'), async (req, res) => {
-  const users = await listUsersDb({ tenantId: req.auth.tenantId }).map(sanitizeUser);
+  const users = (await listUsersDb({ tenantId: req.auth.tenantId })).map(sanitizeUser);
   res.json({ ok: true, users });
 });
 
@@ -550,7 +550,7 @@ router.get('/students', authRequired, rolesAllowed('school_admin', 'teacher'), a
   if (!grade || !section) {
     return res.status(400).json({ ok: false, error: 'grade and section are required' });
   }
-  if (req.auth.role === 'teacher' && !canTeacherAccessDb(req.auth.tenantId, req.auth.userId, grade, section)) {
+  if (req.auth.role === 'teacher' && !(await canTeacherAccessDb(req.auth.tenantId, req.auth.userId, grade, section))) {
     return res.status(403).json({ ok: false, error: 'Access denied for selected class/section' });
   }
   const students = await getTenantStudentsDb(req.auth.tenantId, grade, section);
@@ -589,7 +589,7 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
 
   const batchId = `${Date.now()}`;
   const timestamp = new Date().toISOString();
-  let inserted = 0;
+  const insertRows = [];
 
   for (const row of rows) {
     const studentName = cleanText(row.studentName);
@@ -625,9 +625,10 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
       plan: cleanText(row.plan),
       level
     };
-    if (await addTenantSubmissionDb(req.auth.tenantId, outRow)) inserted += 1;
+    insertRows.push(outRow);
   }
 
+  const inserted = await addTenantSubmissionsBatchDb(req.auth.tenantId, insertRows);
   return res.json({ ok: true, batchId, inserted });
 });
 

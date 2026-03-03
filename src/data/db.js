@@ -806,24 +806,31 @@ export const deactivateStudentDb = async (studentId) => {
 };
 
 // Admin functions
-export const purgeSchoolDataDb = async ({ keepSessionId = null } = {}) => {
+export const purgeSchoolDataDb = async ({ keepSessionId = null, includeCounts = false } = {}) => {
   const client = await pool.connect();
   try {
     const report = {
-      deletedTenants: (await client.query('SELECT COUNT(*) AS c FROM tenants')).rows[0].c,
-      deletedSchoolAdmins: (await client.query("SELECT COUNT(*) AS c FROM users WHERE role = 'school_admin'")).rows[0].c,
-      deletedTeachers: (await client.query("SELECT COUNT(*) AS c FROM users WHERE role = 'teacher'")).rows[0].c,
-      deletedStudents: (await client.query('SELECT COUNT(*) AS c FROM students')).rows[0].c,
-      deletedAssignments: (await client.query('SELECT COUNT(*) AS c FROM teacher_assignments')).rows[0].c,
-      deletedSubmissions: (await client.query('SELECT COUNT(*) AS c FROM submissions')).rows[0].c,
-      deletedLookups: (await client.query('SELECT COUNT(*) AS c FROM lookups')).rows[0].c
+      deletedTenants: null,
+      deletedSchoolAdmins: null,
+      deletedTeachers: null,
+      deletedStudents: null,
+      deletedAssignments: null,
+      deletedSubmissions: null,
+      deletedLookups: null,
+      countsIncluded: Boolean(includeCounts)
     };
+    if (includeCounts) {
+      report.deletedTenants = (await client.query('SELECT COUNT(*) AS c FROM tenants')).rows[0].c;
+      report.deletedSchoolAdmins = (await client.query("SELECT COUNT(*) AS c FROM users WHERE role = 'school_admin'")).rows[0].c;
+      report.deletedTeachers = (await client.query("SELECT COUNT(*) AS c FROM users WHERE role = 'teacher'")).rows[0].c;
+      report.deletedStudents = (await client.query('SELECT COUNT(*) AS c FROM students')).rows[0].c;
+      report.deletedAssignments = (await client.query('SELECT COUNT(*) AS c FROM teacher_assignments')).rows[0].c;
+      report.deletedSubmissions = (await client.query('SELECT COUNT(*) AS c FROM submissions')).rows[0].c;
+      report.deletedLookups = (await client.query('SELECT COUNT(*) AS c FROM lookups')).rows[0].c;
+    }
 
     await client.query('BEGIN');
-    await client.query('DELETE FROM submissions');
-    await client.query('DELETE FROM teacher_assignments');
-    await client.query('DELETE FROM students');
-    await client.query('DELETE FROM lookups');
+    await client.query('TRUNCATE TABLE submissions, teacher_assignments, students, lookups RESTART IDENTITY');
     await client.query("DELETE FROM users WHERE role <> 'super_admin'");
     await client.query('DELETE FROM tenants');
     if (keepSessionId) {
@@ -1238,6 +1245,48 @@ export const addTenantSubmissionDb = async (tenantId, record) => {
     ]
   );
   return true;
+};
+
+export const addTenantSubmissionsBatchDb = async (tenantId, records = []) => {
+  if (!tenantId || !Array.isArray(records) || !records.length) return 0;
+
+  const values = [];
+  const placeholders = records.map((record, index) => {
+    const start = index * 19;
+    values.push(
+      tenantId,
+      record.timestamp,
+      record.batchId,
+      record.teacherName,
+      record.grade,
+      record.section,
+      record.subject,
+      record.exam,
+      record.maxRecall,
+      record.maxUnderstand,
+      record.maxHots,
+      record.totalMax,
+      record.studentName,
+      record.recall,
+      record.understand,
+      record.hots,
+      record.total,
+      record.plan,
+      record.level
+    );
+    return `($${start + 1}, $${start + 2}, $${start + 3}, $${start + 4}, $${start + 5}, $${start + 6}, $${start + 7}, $${start + 8}, $${start + 9}, $${start + 10}, $${start + 11}, $${start + 12}, $${start + 13}, $${start + 14}, $${start + 15}, $${start + 16}, $${start + 17}, $${start + 18}, $${start + 19})`;
+  });
+
+  const result = await pool.query(
+    `INSERT INTO submissions (
+      tenant_id, timestamp, batch_id, teacher_name, grade, section, subject, exam,
+      max_recall, max_understand, max_hots, total_max,
+      student_name, recall, understand, hots, total, plan, level
+    ) VALUES ${placeholders.join(', ')}`,
+    values
+  );
+
+  return result.rowCount || 0;
 };
 
 export const getTenantSubmissionsDb = async (tenantId) => {

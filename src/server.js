@@ -59,8 +59,17 @@ app.use('/api/v1', v1Router);
 app.use((error, _req, res, next) => {
   if (!error) return next();
   if (res.headersSent) return next(error);
+  const origin = String(_req.headers.origin || '').trim();
+  if (origin && (allowAnyOrigin || isOriginAllowed(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
   if (error?.message === 'Not allowed by CORS') {
     return res.status(403).json({ ok: false, error: 'Not allowed by CORS' });
+  }
+  if (error instanceof SyntaxError && Object.prototype.hasOwnProperty.call(error, 'body')) {
+    return res.status(400).json({ ok: false, error: 'Invalid JSON body' });
   }
 
   console.error('Unhandled request error:', error);
