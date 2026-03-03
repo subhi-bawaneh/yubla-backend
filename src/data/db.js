@@ -1009,6 +1009,128 @@ const buildTeacherImportUsernameInternal = async ({ teacherNo }) => {
   return candidate;
 };
 
+const resolveTenantForImportWithClientInternal = async (client, tenantCache, schoolName, defaultTenantId = null) => {
+  if (defaultTenantId) {
+    const cacheKey = `default:${defaultTenantId}`;
+    if (tenantCache.has(cacheKey)) return tenantCache.get(cacheKey);
+    const result = await client.query('SELECT * FROM tenants WHERE id = $1 LIMIT 1', [defaultTenantId]);
+    const tenant = mapTenant(result.rows[0]);
+    tenantCache.set(cacheKey, tenant);
+    return tenant;
+  }
+
+  const key = cleanText(schoolName);
+  if (!key) return null;
+  const cacheKey = `school:${key.toLowerCase()}`;
+  if (tenantCache.has(cacheKey)) return tenantCache.get(cacheKey);
+
+  let result = await client.query(
+    `SELECT * FROM tenants
+     WHERE LOWER(code) = LOWER($1) OR LOWER(TRIM(name)) = LOWER(TRIM($1))
+     ORDER BY CASE WHEN LOWER(code) = LOWER($1) THEN 0 ELSE 1 END
+     LIMIT 1`,
+    [key]
+  );
+  let row = result.rows[0];
+
+  if (!row) {
+    result = await client.query(
+      `SELECT * FROM tenants WHERE LOWER(name) LIKE $1 ORDER BY LENGTH(name) ASC LIMIT 1`,
+      [`%${key.toLowerCase()}%`]
+    );
+    row = result.rows[0];
+  }
+
+  if (!row) {
+    const normalized = normalizeCode(key)
+      .replace(/[^A-Z0-9-]/g, '')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+    const base = (normalized || 'SCHOOL').slice(0, 18);
+    let code = base;
+    let i = 1;
+    while (true) {
+      const exists = await client.query('SELECT 1 AS ok FROM tenants WHERE LOWER(code) = LOWER($1) LIMIT 1', [code]);
+      if (!exists.rows[0]?.ok) break;
+      code = `${base}-${i}`;
+      i += 1;
+    }
+
+    const tenantId = `t-${code.toLowerCase()}-${Math.random().toString(36).slice(2, 7)}`;
+    const inserted = await client.query(
+      `INSERT INTO tenants (id, code, name, city, active) VALUES ($1, $2, $3, '', true) RETURNING *`,
+      [tenantId, code, key]
+    );
+    row = inserted.rows[0];
+  }
+
+  const tenant = mapTenant(row);
+  tenantCache.set(cacheKey, tenant);
+  return tenant;
+};
+
+const ensureSchoolAdminForTenantWithClientInternal = async (client, tenant, ensuredTenantIds) => {
+  if (!tenant?.id) return;
+  if (ensuredTenantIds.has(tenant.id)) return;
+
+  const existing = await client.query(
+    `SELECT 1 AS ok FROM users WHERE tenant_id = $1 AND role = 'school_admin' LIMIT 1`,
+    [tenant.id]
+  );
+  if (existing.rows[0]?.ok) {
+    ensuredTenantIds.add(tenant.id);
+    return;
+  }
+
+  const base = `admin.${sanitizeUsernamePart(tenant.code) || 'school'}`;
+  const displayName = `مديرة ${tenant.name}`;
+  const passwordHash = hashPassword('Admin@123');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const username = attempt === 0 ? base : `${base}.${attempt}`;
+    const inserted = await client.query(
+      `INSERT INTO users (id, username, display_name, employee_no, password_hash, password_plain, role, tenant_id, active)
+       VALUES ($1, $2, $3, '', $4, 'Admin@123', 'school_admin', $5, true)
+       ON CONFLICT (username) DO NOTHING
+       RETURNING id`,
+      [makeId('u'), username, displayName, passwordHash, tenant.id]
+    );
+    if (inserted.rows[0]?.id) {
+      ensuredTenantIds.add(tenant.id);
+      return;
+    }
+  }
+
+  // Best-effort fallback in race cases.
+  ensuredTenantIds.add(tenant.id);
+};
+
+const insertLookupValuesBatchWithClientInternal = async (client, tenantId, type, valuesSet) => {
+  const values = [...(valuesSet || [])].map((value) => cleanText(value)).filter(Boolean);
+  if (!tenantId || !values.length) return;
+  await client.query(
+    `INSERT INTO lookups (tenant_id, type, value)
+     SELECT $1, $2, UNNEST($3::text[])
+     ON CONFLICT (tenant_id, type, value) DO NOTHING`,
+    [tenantId, type, values]
+  );
+};
+
+const syncTeacherLookupForTenantWithClientInternal = async (client, tenantId) => {
+  const result = await client.query(
+    `SELECT display_name FROM users WHERE tenant_id = $1 AND role = 'teacher' AND active = true ORDER BY display_name`,
+    [tenantId]
+  );
+  const teacherNames = [...new Set(result.rows.map((row) => cleanText(row.display_name)).filter(Boolean))];
+  await client.query(`DELETE FROM lookups WHERE tenant_id = $1 AND type = 'teachers'`, [tenantId]);
+  if (!teacherNames.length) return;
+  await client.query(
+    `INSERT INTO lookups (tenant_id, type, value)
+     SELECT $1, 'teachers', UNNEST($2::text[])
+     ON CONFLICT (tenant_id, type, value) DO NOTHING`,
+    [tenantId, teacherNames]
+  );
+};
+
 export const importStudentsRowsDb = async (rows, { defaultTenantId = null } = {}) => {
   const report = {
     total: Array.isArray(rows) ? rows.length : 0,
@@ -1022,7 +1144,39 @@ export const importStudentsRowsDb = async (rows, { defaultTenantId = null } = {}
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    
+
+    const tenantCache = new Map();
+    const ensuredTenantAdmins = new Set();
+    const tenantStates = new Map();
+    const getTenantState = async (tenantId) => {
+      if (tenantStates.has(tenantId)) return tenantStates.get(tenantId);
+      const studentsResult = await client.query(
+        `SELECT id, student_no, student_name, grade, section FROM students WHERE tenant_id = $1`,
+        [tenantId]
+      );
+      const studentsByNo = new Map();
+      const studentsByComposite = new Map();
+      for (const row of studentsResult.rows) {
+        const entity = {
+          id: row.id,
+          studentNo: cleanText(row.student_no),
+          studentName: cleanText(row.student_name),
+          grade: cleanText(row.grade),
+          section: cleanText(row.section)
+        };
+        if (entity.studentNo) studentsByNo.set(entity.studentNo, entity);
+        studentsByComposite.set(`${entity.studentName.toLowerCase()}|${entity.grade}|${entity.section}`, entity);
+      }
+      const state = {
+        studentsByNo,
+        studentsByComposite,
+        grades: new Set(),
+        sections: new Set()
+      };
+      tenantStates.set(tenantId, state);
+      return state;
+    };
+
     for (let index = 0; index < rows.length; index++) {
       const rawRow = rows[index];
       const line = index + 2;
@@ -1031,54 +1185,77 @@ export const importStudentsRowsDb = async (rows, { defaultTenantId = null } = {}
       const studentName = cleanText(rawRow.studentName || rawRow.student_name || rawRow.name);
       const grade = cleanText(rawRow.grade);
       const section = cleanText(rawRow.section);
-      const tenant = await resolveTenantForImportInternal(schoolName, defaultTenantId);
-      if (tenant) await ensureSchoolAdminForTenantInternal(tenant);
-
-      if (!tenant) {
-        report.errors.push(`السطر ${line}: تعذر تحديد المدرسة (${schoolName || 'بدون اسم'})`);
-        continue;
-      }
-      if (!studentName || !grade || !section) {
-        report.errors.push(`السطر ${line}: البيانات ناقصة للطالبة`);
-        continue;
-      }
 
       try {
-        let existing = null;
-        if (studentNo) {
-          const result = await client.query('SELECT id FROM students WHERE tenant_id = $1 AND student_no = $2 LIMIT 1', [tenant.id, studentNo]);
-          existing = result.rows[0];
+        const tenant = await resolveTenantForImportWithClientInternal(client, tenantCache, schoolName, defaultTenantId);
+        if (tenant) await ensureSchoolAdminForTenantWithClientInternal(client, tenant, ensuredTenantAdmins);
+
+        if (!tenant) {
+          report.errors.push(`السطر ${line}: تعذر تحديد المدرسة (${schoolName || 'بدون اسم'})`);
+          continue;
         }
-        if (!existing) {
-          const result = await client.query(
-            `SELECT id FROM students WHERE tenant_id = $1 AND student_name = $2 AND grade = $3 AND section = $4 LIMIT 1`,
-            [tenant.id, studentName, grade, section]
-          );
-          existing = result.rows[0];
+        if (!studentName || !grade || !section) {
+          report.errors.push(`السطر ${line}: البيانات ناقصة للطالبة`);
+          continue;
         }
 
-        if (existing) {
+        const state = await getTenantState(tenant.id);
+        let existing = null;
+        if (studentNo) existing = state.studentsByNo.get(studentNo) || null;
+        if (!existing) {
+          existing = state.studentsByComposite.get(`${studentName.toLowerCase()}|${grade}|${section}`) || null;
+        }
+
+        if (existing?.id) {
           await client.query(
-            `UPDATE students SET student_no = CASE WHEN $1 <> '' THEN $1 ELSE student_no END,
-             student_name = $2, grade = $3, section = $4, active = true WHERE id = $5`,
+            `UPDATE students
+             SET student_no = CASE WHEN $1 <> '' THEN $1 ELSE student_no END,
+                 student_name = $2, grade = $3, section = $4, active = true
+             WHERE id = $5`,
             [studentNo, studentName, grade, section, existing.id]
           );
           report.updated += 1;
+
+          if (existing.studentNo && existing.studentNo !== studentNo) state.studentsByNo.delete(existing.studentNo);
+          if (studentNo) state.studentsByNo.set(studentNo, { ...existing, studentNo, studentName, grade, section });
+          state.studentsByComposite.set(`${studentName.toLowerCase()}|${grade}|${section}`, {
+            ...existing,
+            studentNo,
+            studentName,
+            grade,
+            section
+          });
         } else {
-          await client.query(
-            `INSERT INTO students (tenant_id, student_no, student_name, grade, section, active) VALUES ($1, $2, $3, $4, $5, true)`,
+          const inserted = await client.query(
+            `INSERT INTO students (tenant_id, student_no, student_name, grade, section, active)
+             VALUES ($1, $2, $3, $4, $5, true)
+             RETURNING id`,
             [tenant.id, studentNo, studentName, grade, section]
           );
+          const studentId = inserted.rows[0]?.id;
           report.inserted += 1;
+          if (studentNo) state.studentsByNo.set(studentNo, { id: studentId, studentNo, studentName, grade, section });
+          state.studentsByComposite.set(`${studentName.toLowerCase()}|${grade}|${section}`, {
+            id: studentId,
+            studentNo,
+            studentName,
+            grade,
+            section
+          });
         }
 
-        await ensureLookupValueInternal(tenant.id, 'grades', grade);
-        await ensureLookupValueInternal(tenant.id, 'sections', section);
+        state.grades.add(grade);
+        state.sections.add(section);
       } catch (error) {
         report.errors.push(`السطر ${line}: ${error.message}`);
       }
     }
-    
+
+    for (const [tenantId, state] of tenantStates.entries()) {
+      await insertLookupValuesBatchWithClientInternal(client, tenantId, 'grades', state.grades);
+      await insertLookupValuesBatchWithClientInternal(client, tenantId, 'sections', state.sections);
+    }
+
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -1101,12 +1278,144 @@ export const importTeachersRowsDb = async (rows, { defaultTenantId = null, defau
   };
   if (!Array.isArray(rows) || !rows.length) return report;
 
-  const touchedTenantIds = new Set();
   const client = await pool.connect();
-  
   try {
     await client.query('BEGIN');
-    
+
+    const touchedTenantIds = new Set();
+    const tenantCache = new Map();
+    const ensuredTenantAdmins = new Set();
+    const tenantStates = new Map();
+
+    const usernamesResult = await client.query(`SELECT LOWER(username) AS username FROM users`);
+    const takenUsernames = new Set(usernamesResult.rows.map((row) => cleanText(row.username)).filter(Boolean));
+    const reserveTeacherUsername = (teacherNo) => {
+      const numPart = String(teacherNo || '')
+        .replace(/\D+/g, '')
+        .slice(-6);
+      const base = numPart ? `t${numPart}` : `t${Date.now().toString(36).slice(-6)}`;
+      let candidate = base;
+      let i = 1;
+      while (takenUsernames.has(candidate.toLowerCase())) {
+        candidate = `${base}${i}`;
+        i += 1;
+      }
+      takenUsernames.add(candidate.toLowerCase());
+      return candidate;
+    };
+    const pendingTeacherCreates = [];
+    const pendingAssignments = [];
+    const insertTeacherRow = async (teacher) => {
+      await client.query(
+        `INSERT INTO users (id, username, display_name, employee_no, password_hash, password_plain, role, tenant_id, active)
+         VALUES ($1, $2, $3, $4, $5, $6, 'teacher', $7, true)`,
+        [teacher.id, teacher.username, teacher.displayName, teacher.employeeNo, teacher.passwordHash, teacher.passwordPlain, teacher.tenantId]
+      );
+    };
+    const flushTeachers = async () => {
+      if (!pendingTeacherCreates.length) return;
+      const BATCH_SIZE = 250;
+      for (let i = 0; i < pendingTeacherCreates.length; i += BATCH_SIZE) {
+        const chunk = pendingTeacherCreates.slice(i, i + BATCH_SIZE);
+        try {
+          const values = [];
+          const placeholders = chunk.map((teacher, index) => {
+            const start = index * 7;
+            values.push(
+              teacher.id,
+              teacher.username,
+              teacher.displayName,
+              teacher.employeeNo,
+              teacher.passwordHash,
+              teacher.passwordPlain,
+              teacher.tenantId
+            );
+            return `($${start + 1}, $${start + 2}, $${start + 3}, $${start + 4}, $${start + 5}, $${start + 6}, 'teacher', $${start + 7}, true)`;
+          });
+          await client.query(
+            `INSERT INTO users (id, username, display_name, employee_no, password_hash, password_plain, role, tenant_id, active)
+             VALUES ${placeholders.join(', ')}`,
+            values
+          );
+        } catch (error) {
+          if (error?.code !== '23505') throw error;
+          // Retry row-by-row only for conflicting chunks.
+          for (const teacher of chunk) {
+            let inserted = false;
+            for (let attempt = 0; attempt < 30; attempt++) {
+              try {
+                await insertTeacherRow(teacher);
+                inserted = true;
+                break;
+              } catch (insertError) {
+                if (insertError?.code !== '23505') throw insertError;
+                teacher.username = reserveTeacherUsername(teacher.employeeNo);
+              }
+            }
+            if (!inserted) throw new Error(`تعذر إنشاء اسم مستخدم فريد للمعلمة ${teacher.displayName}`);
+          }
+        }
+      }
+    };
+    const flushAssignments = async () => {
+      if (!pendingAssignments.length) return;
+      const BATCH_SIZE = 500;
+      let insertedCount = 0;
+      for (let i = 0; i < pendingAssignments.length; i += BATCH_SIZE) {
+        const chunk = pendingAssignments.slice(i, i + BATCH_SIZE);
+        const values = [];
+        const placeholders = chunk.map((row, index) => {
+          const start = index * 5;
+          values.push(row.tenantId, row.userId, row.grade, row.section, row.subject);
+          return `($${start + 1}, $${start + 2}, $${start + 3}, $${start + 4}, $${start + 5})`;
+        });
+        const result = await client.query(
+          `INSERT INTO teacher_assignments (tenant_id, user_id, grade, section, subject)
+           VALUES ${placeholders.join(', ')}
+           ON CONFLICT (tenant_id, user_id, grade, section, subject) DO NOTHING`,
+          values
+        );
+        insertedCount += result.rowCount || 0;
+      }
+      report.assignmentsInserted += insertedCount;
+      report.assignmentsSkipped += pendingAssignments.length - insertedCount;
+    };
+
+    const getTenantState = async (tenantId) => {
+      if (tenantStates.has(tenantId)) return tenantStates.get(tenantId);
+
+      const teachersResult = await client.query(
+        `SELECT * FROM users WHERE tenant_id = $1 AND role = 'teacher'`,
+        [tenantId]
+      );
+      const teachersByEmployeeNo = new Map();
+      const teachersByName = new Map();
+      for (const row of teachersResult.rows) {
+        const teacher = mapUser(row);
+        if (teacher?.employeeNo) teachersByEmployeeNo.set(cleanText(teacher.employeeNo), teacher);
+        if (teacher?.displayName) teachersByName.set(cleanText(teacher.displayName).toLowerCase(), teacher);
+      }
+
+      const assignmentsResult = await client.query(
+        `SELECT user_id, grade, section, subject FROM teacher_assignments WHERE tenant_id = $1`,
+        [tenantId]
+      );
+      const assignmentKeys = new Set(
+        assignmentsResult.rows.map((row) => `${row.user_id}|${cleanText(row.grade)}|${cleanText(row.section)}|${cleanText(row.subject)}`)
+      );
+
+      const state = {
+        teachersByEmployeeNo,
+        teachersByName,
+        assignmentKeys,
+        grades: new Set(),
+        sections: new Set(),
+        subjects: new Set()
+      };
+      tenantStates.set(tenantId, state);
+      return state;
+    };
+
     for (let index = 0; index < rows.length; index++) {
       const rawRow = rows[index];
       const line = index + 2;
@@ -1116,88 +1425,105 @@ export const importTeachersRowsDb = async (rows, { defaultTenantId = null, defau
       const grade = cleanText(rawRow.grade);
       const section = cleanText(rawRow.section);
       const subject = cleanText(rawRow.subject);
-      const tenant = await resolveTenantForImportInternal(schoolName, defaultTenantId);
-      if (tenant) await ensureSchoolAdminForTenantInternal(tenant);
-
-      if (!tenant) {
-        report.errors.push(`السطر ${line}: تعذر تحديد المدرسة (${schoolName || 'بدون اسم'})`);
-        continue;
-      }
-      if (!teacherName || !grade || !section || !subject) {
-        report.errors.push(`السطر ${line}: البيانات ناقصة للمعلمة أو المادة/الصف/الشعبة`);
-        continue;
-      }
 
       try {
-        let teacher = null;
-        if (teacherNo) {
-          teacher = await findTeacherByEmployeeNoDb(tenant.id, teacherNo);
+        const tenant = await resolveTenantForImportWithClientInternal(client, tenantCache, schoolName, defaultTenantId);
+        if (tenant) await ensureSchoolAdminForTenantWithClientInternal(client, tenant, ensuredTenantAdmins);
+
+        if (!tenant) {
+          report.errors.push(`السطر ${line}: تعذر تحديد المدرسة (${schoolName || 'بدون اسم'})`);
+          continue;
         }
-        if (!teacher) {
-          const result = await client.query(
-            `SELECT * FROM users WHERE tenant_id = $1 AND role = 'teacher' AND LOWER(display_name) = LOWER($2) LIMIT 1`,
-            [tenant.id, teacherName]
-          );
-          teacher = mapUser(result.rows[0]);
+        if (!teacherName || !grade || !section || !subject) {
+          report.errors.push(`السطر ${line}: البيانات ناقصة للمعلمة أو المادة/الصف/الشعبة`);
+          continue;
         }
 
+        const state = await getTenantState(tenant.id);
+        let teacher = null;
+        if (teacherNo) teacher = state.teachersByEmployeeNo.get(teacherNo) || null;
+        if (!teacher) teacher = state.teachersByName.get(teacherName.toLowerCase()) || null;
+
         if (!teacher) {
-          const username = await buildTeacherImportUsernameInternal({ tenantCode: tenant.code, teacherNo });
           const autoPassword = teacherNo ? `T@${teacherNo.slice(-6)}` : defaultPassword;
-          const userId = makeId('u');
-          await client.query(
-            `INSERT INTO users (id, username, display_name, employee_no, password_hash, password_plain, role, tenant_id, active)
-             VALUES ($1, $2, $3, $4, $5, $6, 'teacher', $7, true)`,
-            [userId, username, teacherName, teacherNo, hashPassword(autoPassword), autoPassword, tenant.id]
-          );
-          teacher = await findUserByIdDb(userId);
-          if (!teacher?.id) {
-            report.errors.push(`السطر ${line}: تعذر إنشاء حساب للمعلمة ${teacherName}`);
-            continue;
-          }
+          teacher = {
+            id: makeId('u'),
+            username: reserveTeacherUsername(teacherNo),
+            displayName: teacherName,
+            employeeNo: teacherNo,
+            passwordHash: hashPassword(autoPassword),
+            passwordPlain: autoPassword,
+            tenantId: tenant.id,
+            role: 'teacher',
+            active: true
+          };
+          pendingTeacherCreates.push({
+            id: teacher.id,
+            username: teacher.username,
+            displayName: teacher.displayName,
+            employeeNo: teacher.employeeNo,
+            passwordHash: teacher.passwordHash,
+            passwordPlain: teacher.passwordPlain,
+            tenantId: teacher.tenantId
+          });
           report.teachersCreated += 1;
         } else {
-          const needsUpdate = teacher.displayName !== teacherName || (teacherNo && teacher.employeeNo !== teacherNo);
+          const nextEmployeeNo = teacherNo || teacher.employeeNo || '';
+          const needsUpdate = cleanText(teacher.displayName) !== teacherName || cleanText(teacher.employeeNo) !== nextEmployeeNo;
           if (needsUpdate) {
-            await client.query(
-              `UPDATE users SET display_name = $1, 
-               employee_no = CASE WHEN $2 <> '' THEN $2 ELSE employee_no END,
-               updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
-              [teacherName, teacherNo, teacher.id]
+            const updated = await client.query(
+              `UPDATE users
+               SET display_name = $1,
+                   employee_no = $2,
+                   active = true,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = $3
+               RETURNING *`,
+              [teacherName, nextEmployeeNo, teacher.id]
             );
+            teacher = mapUser(updated.rows[0] || teacher);
             report.teachersUpdated += 1;
           }
         }
 
-        const assignmentExists = await client.query(
-          `SELECT id FROM teacher_assignments 
-           WHERE tenant_id = $1 AND user_id = $2 AND grade = $3 AND section = $4 AND subject = $5 LIMIT 1`,
-          [tenant.id, teacher.id, grade, section, subject]
-        );
+        if (teacher?.employeeNo) state.teachersByEmployeeNo.set(cleanText(teacher.employeeNo), teacher);
+        state.teachersByName.set(cleanText(teacher.displayName || teacherName).toLowerCase(), teacher);
 
-        if (assignmentExists.rows[0]) {
+        const assignmentKey = `${teacher.id}|${grade}|${section}|${subject}`;
+        if (state.assignmentKeys.has(assignmentKey)) {
           report.assignmentsSkipped += 1;
         } else {
-          await client.query(
-            `INSERT INTO teacher_assignments (tenant_id, user_id, grade, section, subject) VALUES ($1, $2, $3, $4, $5)`,
-            [tenant.id, teacher.id, grade, section, subject]
-          );
-          report.assignmentsInserted += 1;
+          pendingAssignments.push({
+            tenantId: tenant.id,
+            userId: teacher.id,
+            grade,
+            section,
+            subject
+          });
+          state.assignmentKeys.add(assignmentKey);
         }
 
-        await ensureLookupValueInternal(tenant.id, 'grades', grade);
-        await ensureLookupValueInternal(tenant.id, 'sections', section);
-        await ensureLookupValueInternal(tenant.id, 'subjects', subject);
+        state.grades.add(grade);
+        state.sections.add(section);
+        state.subjects.add(subject);
         touchedTenantIds.add(tenant.id);
       } catch (error) {
         report.errors.push(`السطر ${line}: ${error.message}`);
       }
     }
 
-    for (const tenantId of touchedTenantIds) {
-      await syncTeacherLookupFromUsersInternal(tenantId);
+    await flushTeachers();
+    await flushAssignments();
+
+    for (const [tenantId, state] of tenantStates.entries()) {
+      await insertLookupValuesBatchWithClientInternal(client, tenantId, 'grades', state.grades);
+      await insertLookupValuesBatchWithClientInternal(client, tenantId, 'sections', state.sections);
+      await insertLookupValuesBatchWithClientInternal(client, tenantId, 'subjects', state.subjects);
     }
-    
+    for (const tenantId of touchedTenantIds) {
+      await syncTeacherLookupForTenantWithClientInternal(client, tenantId);
+    }
+
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

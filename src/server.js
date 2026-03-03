@@ -45,10 +45,11 @@ const corsOptions = {
   },
   credentials: true
 };
+const jsonBodyLimit = String(process.env.JSON_BODY_LIMIT || '10mb').trim() || '10mb';
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: jsonBodyLimit }));
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
@@ -67,6 +68,9 @@ app.use((error, _req, res, next) => {
   }
   if (error?.message === 'Not allowed by CORS') {
     return res.status(403).json({ ok: false, error: 'Not allowed by CORS' });
+  }
+  if (error?.type === 'entity.too.large') {
+    return res.status(413).json({ ok: false, error: 'Request body too large' });
   }
   if (error instanceof SyntaxError && Object.prototype.hasOwnProperty.call(error, 'body')) {
     return res.status(400).json({ ok: false, error: 'Invalid JSON body' });
