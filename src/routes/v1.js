@@ -33,7 +33,7 @@ import {
   updateTenantDb,
   updateUserDb
 } from '../data/db.js';
-import { createSession, hashPassword, isSessionExpired, verifyPassword } from '../utils/security.js';
+import { SESSION_TTL_MS, createSession, hashPassword, isSessionExpired, verifyPassword } from '../utils/security.js';
 
 const router = Router();
 const asyncHandler = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -62,6 +62,15 @@ const sanitizeUser = (user, options = {}) => ({
   ...(options.includePassword ? { passwordPlain: user.passwordPlain || '' } : {})
 });
 
+const isProduction = process.env.NODE_ENV === 'production';
+const authCookieOptions = {
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: isProduction ? 'none' : 'lax',
+  path: '/',
+  maxAge: SESSION_TTL_MS
+};
+
 const computeLevel = (recall, understand, hots, maxRecall, maxUnderstand, maxHots) => {
   if (maxRecall <= 0 || maxUnderstand <= 0 || maxHots <= 0) return '-';
   const pr = (recall / maxRecall) * 100;
@@ -70,6 +79,18 @@ const computeLevel = (recall, understand, hots, maxRecall, maxUnderstand, maxHot
   if (pr < 50 || pu < 50 || ph < 50) return 'ضعيف';
   if (pr >= 80 && pu >= 80 && ph >= 80) return 'ممتاز';
   return 'جيد';
+};
+
+const parseCookies = (cookieHeader) => {
+  const raw = String(cookieHeader || '');
+  if (!raw) return {};
+  return raw.split(';').reduce((acc, chunk) => {
+    const [keyPart, ...valueParts] = chunk.split('=');
+    const key = String(keyPart || '').trim();
+    if (!key) return acc;
+    acc[key] = decodeURIComponent(valueParts.join('=').trim());
+    return acc;
+  }, {});
 };
 
 const getBearerToken = (req) => {
@@ -88,7 +109,15 @@ const getBearerToken = (req) => {
   if (fallbackHeader) return fallbackHeader;
 
   const queryToken = cleanText(req.query?.accessToken || req.query?.token);
-  return queryToken || null;
+  if (queryToken) return queryToken;
+
+  const cookies = parseCookies(req.headers.cookie);
+  const cookieToken =
+    cleanText(cookies.accessToken) ||
+    cleanText(cookies.token) ||
+    cleanText(cookies.sessionToken) ||
+    cleanText(cookies.sessionId);
+  return cookieToken || null;
 };
 
 const authRequired = async (req, res, next) => {
@@ -187,6 +216,7 @@ router.post('/auth/login', async (req, res) => {
 
   const session = await saveSessionDb(createSession(user));
   const tenant = user.tenantId ? await findTenantByIdDb(user.tenantId) : null;
+  res.cookie('accessToken', session.id, authCookieOptions);
   return res.json({
     ok: true,
     accessToken: session.id,
@@ -199,6 +229,7 @@ router.post('/auth/login', async (req, res) => {
 
 router.post('/auth/logout', authRequired, async (req, res) => {
   await deleteSessionDb(req.auth.id);
+  res.clearCookie('accessToken', authCookieOptions);
   res.json({ ok: true });
 });
 
