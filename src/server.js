@@ -17,8 +17,13 @@ const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const configuredOrigins = parseOriginList(process.env.FRONTEND_ORIGIN);
 const defaultOrigins =
   process.env.NODE_ENV === 'production'
-    ? ['https://yubla-frontend.vercel.app']
-    : ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://yubla-frontend.vercel.app'];
+    ? ['https://yubla-frontend.vercel.app', 'https://www.qiyasjo.org']
+    : [
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+        'https://yubla-frontend.vercel.app',
+        'https://www.qiyasjo.org'
+      ];
 const allowAnyOrigin = configuredOrigins.includes('*');
 const wildcardOriginPatterns = configuredOrigins
   .map(normalizeOrigin)
