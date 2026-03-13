@@ -161,6 +161,20 @@ const toNumber = (value, fallback = 0) => {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
 };
+const isBlankValue = (value) => value === null || value === undefined || (typeof value === 'string' && value.trim() === '');
+const parseOptionalMark = (value) => {
+  if (isBlankValue(value)) {
+    return { ok: true, missing: true, value: null };
+  }
+  const num = Number(value);
+  if (!Number.isFinite(num) || !Number.isInteger(num)) {
+    return { ok: false, error: 'must be an integer' };
+  }
+  if (num < 0) {
+    return { ok: false, error: 'must be at least 0' };
+  }
+  return { ok: true, missing: false, value: num };
+};
 
 const normalizeTeacherImportRow = (row) => ({
   schoolName: cleanText(row?.schoolName || row?.school || row?.['اسم المدرسة'] || row?.['المدرسة']),
@@ -573,9 +587,20 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
   const maxHots = toNumber(header.maxHots, 0);
   const totalMax = toNumber(header.totalMax, maxRecall + maxUnderstand + maxHots);
   const teacherNameInput = cleanText(header.teacherName);
+  const maxFields = [
+    ['maxRecall', maxRecall],
+    ['maxUnderstand', maxUnderstand],
+    ['maxHots', maxHots],
+    ['totalMax', totalMax]
+  ];
 
   if (!grade || !section || !subject || !exam) {
     return res.status(400).json({ ok: false, error: 'grade, section, subject and exam are required' });
+  }
+  for (const [field, value] of maxFields) {
+    if (!Number.isInteger(value) || value < 0) {
+      return res.status(400).json({ ok: false, error: `${field} must be an integer >= 0` });
+    }
   }
   if (req.auth.role === 'school_admin' && !teacherNameInput) {
     return res.status(400).json({ ok: false, error: 'teacherName is required for school_admin submissions' });
@@ -595,16 +620,37 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
     const studentName = cleanText(row.studentName);
     if (!studentName) continue;
 
-    const recall = toNumber(row.recall, 0);
-    const understand = toNumber(row.understand, 0);
-    const hots = toNumber(row.hots, 0);
-    const total = recall + understand + hots;
-
-    if (recall > maxRecall || understand > maxUnderstand || hots > maxHots) {
-      return res.status(400).json({ ok: false, error: `Mark exceeds max limits for ${studentName}` });
+    const recallParsed = parseOptionalMark(row.recall);
+    if (!recallParsed.ok) {
+      return res.status(400).json({ ok: false, error: `recall for ${studentName} ${recallParsed.error}` });
+    }
+    if (!recallParsed.missing && recallParsed.value > maxRecall) {
+      return res.status(400).json({ ok: false, error: `recall for ${studentName} cannot exceed maxRecall (${maxRecall})` });
     }
 
-    const level = computeLevel(recall, understand, hots, maxRecall, maxUnderstand, maxHots);
+    const understandParsed = parseOptionalMark(row.understand);
+    if (!understandParsed.ok) {
+      return res.status(400).json({ ok: false, error: `understand for ${studentName} ${understandParsed.error}` });
+    }
+    if (!understandParsed.missing && understandParsed.value > maxUnderstand) {
+      return res
+        .status(400)
+        .json({ ok: false, error: `understand for ${studentName} cannot exceed maxUnderstand (${maxUnderstand})` });
+    }
+
+    const hotsParsed = parseOptionalMark(row.hots);
+    if (!hotsParsed.ok) {
+      return res.status(400).json({ ok: false, error: `hots for ${studentName} ${hotsParsed.error}` });
+    }
+    if (!hotsParsed.missing && hotsParsed.value > maxHots) {
+      return res.status(400).json({ ok: false, error: `hots for ${studentName} cannot exceed maxHots (${maxHots})` });
+    }
+
+    const hasMissingMarks = recallParsed.missing || understandParsed.missing || hotsParsed.missing;
+    const total = hasMissingMarks ? null : recallParsed.value + understandParsed.value + hotsParsed.value;
+    const level = hasMissingMarks
+      ? '-'
+      : computeLevel(recallParsed.value, understandParsed.value, hotsParsed.value, maxRecall, maxUnderstand, maxHots);
     const outRow = {
       timestamp,
       batchId,
@@ -618,9 +664,9 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
       maxHots,
       totalMax,
       studentName,
-      recall,
-      understand,
-      hots,
+      recall: recallParsed.value,
+      understand: understandParsed.value,
+      hots: hotsParsed.value,
       total,
       plan: cleanText(row.plan),
       level

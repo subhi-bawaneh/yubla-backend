@@ -261,10 +261,10 @@ const createSchema = async (client) => {
       max_hots REAL NOT NULL,
       total_max REAL NOT NULL,
       student_name TEXT NOT NULL,
-      recall REAL NOT NULL,
-      understand REAL NOT NULL,
-      hots REAL NOT NULL,
-      total REAL NOT NULL,
+      recall REAL,
+      understand REAL,
+      hots REAL,
+      total REAL,
       plan TEXT NOT NULL DEFAULT '',
       level TEXT NOT NULL DEFAULT '-'
     );
@@ -275,6 +275,17 @@ const createSchema = async (client) => {
   await client.query('CREATE INDEX IF NOT EXISTS idx_students_tenant_grade_section ON students (tenant_id, grade, section)');
   await client.query('CREATE INDEX IF NOT EXISTS idx_submissions_tenant ON submissions (tenant_id)');
   await client.query('CREATE INDEX IF NOT EXISTS idx_assignments_tenant_user ON teacher_assignments (tenant_id, user_id)');
+};
+
+const applySchemaMigrations = async (client) => {
+  await client.query(`
+    ALTER TABLE submissions
+      ALTER COLUMN recall DROP NOT NULL,
+      ALTER COLUMN understand DROP NOT NULL,
+      ALTER COLUMN hots DROP NOT NULL,
+      ALTER COLUMN total DROP NOT NULL
+  `);
+  await client.query(`UPDATE submissions SET plan = '' WHERE plan IS NULL`);
 };
 
 // Meta functions
@@ -338,8 +349,12 @@ export const initDb = async () => {
   
   try {
     const client = await pool.connect();
-    await createSchema(client);
-    client.release();
+    try {
+      await createSchema(client);
+      await applySchemaMigrations(client);
+    } finally {
+      client.release();
+    }
     
     await setMetaValue('schema_version', SCHEMA_VERSION);
     await seedPlatformIfNeeded();
@@ -1619,12 +1634,13 @@ export const getTenantSubmissionsDb = async (tenantId) => {
   const result = await pool.query(
     `SELECT timestamp, batch_id, teacher_name, grade, section, subject, exam,
             max_recall, max_understand, max_hots, total_max,
-            student_name, recall, understand, hots, total, plan, level
+            student_name, recall, understand, hots, total, plan
      FROM submissions
      WHERE tenant_id = $1
      ORDER BY id DESC`,
     [tenantId]
   );
+  const markOrEmpty = (value) => (value === null || value === undefined ? '' : value);
   return result.rows.map((row) => [
     row.timestamp,
     row.batch_id,
@@ -1638,12 +1654,11 @@ export const getTenantSubmissionsDb = async (tenantId) => {
     row.max_hots,
     row.total_max,
     row.student_name,
-    row.recall,
-    row.understand,
-    row.hots,
-    row.total,
-    row.plan,
-    row.level
+    markOrEmpty(row.recall),
+    markOrEmpty(row.understand),
+    markOrEmpty(row.hots),
+    markOrEmpty(row.total),
+    row.plan ?? ''
   ]);
 };
 
