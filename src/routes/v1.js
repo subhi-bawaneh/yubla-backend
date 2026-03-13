@@ -1,6 +1,5 @@
 import { Router } from 'express';
 import {
-  addTenantSubmissionsBatchDb,
   bootstrapTenantDemoDb,
   buildTeacherScopedLookupsDb,
   canTeacherAccessDb,
@@ -27,6 +26,7 @@ import {
   purgeSchoolDataDb,
   importStudentsRowsDb,
   importTeachersRowsDb,
+  replaceTenantSubmissionsBatchDb,
   replaceTenantAssignmentsDb,
   replaceTenantStudentsDb,
   saveSessionDb,
@@ -611,6 +611,9 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
 
   const authUser = await findUserByIdDb(req.auth.userId);
   const teacherName = req.auth.role === 'teacher' ? authUser?.displayName || authUser?.username || '' : teacherNameInput;
+  if (!teacherName) {
+    return res.status(400).json({ ok: false, error: 'teacherName is required' });
+  }
 
   const batchId = `${Date.now()}`;
   const timestamp = new Date().toISOString();
@@ -674,7 +677,11 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
     insertRows.push(outRow);
   }
 
-  const inserted = await addTenantSubmissionsBatchDb(req.auth.tenantId, insertRows);
+  const inserted = await replaceTenantSubmissionsBatchDb(
+    req.auth.tenantId,
+    { teacherName, grade, section, subject, exam },
+    insertRows
+  );
   return res.json({ ok: true, batchId, inserted });
 });
 

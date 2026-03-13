@@ -1630,6 +1630,81 @@ export const addTenantSubmissionsBatchDb = async (tenantId, records = []) => {
   return result.rowCount || 0;
 };
 
+export const replaceTenantSubmissionsBatchDb = async (tenantId, groupKey = {}, records = []) => {
+  if (!tenantId) return 0;
+  const teacherName = cleanText(groupKey.teacherName);
+  const grade = cleanText(groupKey.grade);
+  const section = cleanText(groupKey.section);
+  const subject = cleanText(groupKey.subject);
+  const exam = cleanText(groupKey.exam);
+  if (!teacherName || !grade || !section || !subject || !exam) {
+    throw new Error('teacherName, grade, section, subject and exam are required');
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM submissions
+       WHERE tenant_id = $1
+         AND teacher_name = $2
+         AND grade = $3
+         AND section = $4
+         AND subject = $5
+         AND exam = $6`,
+      [tenantId, teacherName, grade, section, subject, exam]
+    );
+
+    let inserted = 0;
+    if (Array.isArray(records) && records.length) {
+      const values = [];
+      const placeholders = records.map((record, index) => {
+        const start = index * 19;
+        values.push(
+          tenantId,
+          record.timestamp,
+          record.batchId,
+          record.teacherName,
+          record.grade,
+          record.section,
+          record.subject,
+          record.exam,
+          record.maxRecall,
+          record.maxUnderstand,
+          record.maxHots,
+          record.totalMax,
+          record.studentName,
+          record.recall,
+          record.understand,
+          record.hots,
+          record.total,
+          record.plan,
+          record.level
+        );
+        return `($${start + 1}, $${start + 2}, $${start + 3}, $${start + 4}, $${start + 5}, $${start + 6}, $${start + 7}, $${start + 8}, $${start + 9}, $${start + 10}, $${start + 11}, $${start + 12}, $${start + 13}, $${start + 14}, $${start + 15}, $${start + 16}, $${start + 17}, $${start + 18}, $${start + 19})`;
+      });
+
+      const result = await client.query(
+        `INSERT INTO submissions (
+          tenant_id, timestamp, batch_id, teacher_name, grade, section, subject, exam,
+          max_recall, max_understand, max_hots, total_max,
+          student_name, recall, understand, hots, total, plan, level
+        ) VALUES ${placeholders.join(', ')}`,
+        values
+      );
+      inserted = result.rowCount || 0;
+    }
+
+    await client.query('COMMIT');
+    return inserted;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 export const getTenantSubmissionsDb = async (tenantId) => {
   const result = await pool.query(
     `SELECT timestamp, batch_id, teacher_name, grade, section, subject, exam,
