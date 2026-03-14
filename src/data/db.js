@@ -1705,6 +1705,63 @@ export const replaceTenantSubmissionsBatchDb = async (tenantId, groupKey = {}, r
   }
 };
 
+export const dedupeSubmissionsDb = async ({ tenantId = null } = {}) => {
+  const normalizedTenantId = cleanText(tenantId) || null;
+  const whereSql = normalizedTenantId ? 'WHERE tenant_id = $1' : '';
+  const params = normalizedTenantId ? [normalizedTenantId] : [];
+
+  const duplicateCountResult = await pool.query(
+    `SELECT COUNT(*) AS c
+     FROM (
+       SELECT id,
+              ROW_NUMBER() OVER (
+                PARTITION BY tenant_id, teacher_name, grade, section, subject, exam, student_name
+                ORDER BY id DESC
+              ) AS rn
+       FROM submissions
+       ${whereSql}
+     ) ranked
+     WHERE rn > 1`,
+    params
+  );
+  const duplicatesBefore = Number(duplicateCountResult.rows[0]?.c || 0);
+
+  if (!duplicatesBefore) {
+    const totalResult = await pool.query(`SELECT COUNT(*) AS c FROM submissions ${whereSql}`, params);
+    return {
+      tenantId: normalizedTenantId,
+      duplicatesBefore: 0,
+      deleted: 0,
+      totalAfter: Number(totalResult.rows[0]?.c || 0)
+    };
+  }
+
+  const deleteResult = await pool.query(
+    `WITH ranked AS (
+       SELECT id,
+              ROW_NUMBER() OVER (
+                PARTITION BY tenant_id, teacher_name, grade, section, subject, exam, student_name
+                ORDER BY id DESC
+              ) AS rn
+       FROM submissions
+       ${whereSql}
+     )
+     DELETE FROM submissions target
+     USING ranked
+     WHERE target.id = ranked.id
+       AND ranked.rn > 1`,
+    params
+  );
+
+  const totalResult = await pool.query(`SELECT COUNT(*) AS c FROM submissions ${whereSql}`, params);
+  return {
+    tenantId: normalizedTenantId,
+    duplicatesBefore,
+    deleted: deleteResult.rowCount || 0,
+    totalAfter: Number(totalResult.rows[0]?.c || 0)
+  };
+};
+
 export const getTenantSubmissionsDb = async (tenantId) => {
   const result = await pool.query(
     `SELECT timestamp, batch_id, teacher_name, grade, section, subject, exam,

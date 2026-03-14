@@ -7,6 +7,7 @@ import {
   createUserDb,
   deactivateStudentDb,
   deactivateTeacherDb,
+  dedupeSubmissionsDb,
   deleteExpiredSessionsDb,
   deleteSessionDb,
   findSessionDb,
@@ -471,6 +472,15 @@ router.post('/super/system/reset-schools', authRequired, rolesAllowed('super_adm
     return res.status(400).json({ ok: false, error: 'Confirmation is required' });
   }
   const report = await purgeSchoolDataDb({ keepSessionId: req.auth.id, includeCounts: false });
+  return res.json({ ok: true, report });
+});
+
+router.post('/super/system/dedupe-submissions', authRequired, rolesAllowed('super_admin'), async (req, res) => {
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ ok: false, error: 'Confirmation is required' });
+  }
+  const tenantId = cleanText(req.body?.tenantId) || null;
+  const report = await dedupeSubmissionsDb({ tenantId });
   return res.json({ ok: true, report });
 });
 
