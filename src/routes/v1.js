@@ -15,6 +15,7 @@ import {
   findTenantByIdDb,
   findUserByIdDb,
   findUserByUsernameDb,
+  exportSystemBackupDb,
   getSystemStatsDb,
   getTenantAssignmentsDb,
   getTenantLookupsDb,
@@ -30,6 +31,7 @@ import {
   replaceTenantSubmissionsBatchDb,
   replaceTenantAssignmentsDb,
   replaceTenantStudentsDb,
+  restoreSystemBackupDb,
   saveSessionDb,
   updateTenantDb,
   updateUserDb
@@ -482,6 +484,31 @@ router.post('/super/system/dedupe-submissions', authRequired, rolesAllowed('supe
   const tenantId = cleanText(req.body?.tenantId) || null;
   const report = await dedupeSubmissionsDb({ tenantId });
   return res.json({ ok: true, report });
+});
+
+router.get('/super/system/backup/export', authRequired, rolesAllowed('super_admin'), async (_req, res) => {
+  const backup = await exportSystemBackupDb();
+  return res.json({ ok: true, backup });
+});
+
+router.post('/super/system/backup/restore', authRequired, rolesAllowed('super_admin'), async (req, res) => {
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ ok: false, error: 'Confirmation is required' });
+  }
+  const backup = req.body?.backup;
+  if (!backup || typeof backup !== 'object') {
+    return res.status(400).json({ ok: false, error: 'backup payload is required' });
+  }
+  try {
+    const report = await restoreSystemBackupDb(backup, { keepSessionId: req.auth.id });
+    return res.json({ ok: true, report });
+  } catch (error) {
+    console.error('Backup restore failed:', error);
+    return res.status(500).json({
+      ok: false,
+      error: `Restore failed: ${error?.message || 'unexpected error'}`
+    });
+  }
 });
 
 router.post('/super/import/teachers', authRequired, rolesAllowed('super_admin'), async (req, res) => {

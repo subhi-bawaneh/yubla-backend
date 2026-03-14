@@ -1813,6 +1813,246 @@ export const getSystemStatsDb = async () => {
   };
 };
 
+const normalizeBackupContainer = (backup) => {
+  const source = backup && typeof backup === 'object' ? backup : {};
+  if (source.data && typeof source.data === 'object') return source.data;
+  return source;
+};
+
+const asArray = (value) => (Array.isArray(value) ? value : []);
+
+const toTsOrNull = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+const resetSequence = async (client, tableName, sequenceName) => {
+  const result = await client.query(`SELECT COALESCE(MAX(id), 0) AS max_id FROM ${tableName}`);
+  const maxId = Number(result.rows[0]?.max_id || 0);
+  if (maxId > 0) {
+    await client.query(`SELECT setval($1::regclass, $2, true)`, [sequenceName, maxId]);
+    return;
+  }
+  await client.query(`SELECT setval($1::regclass, 1, false)`, [sequenceName]);
+};
+
+export const exportSystemBackupDb = async () => {
+  const [tenants, users, lookups, students, teacherAssignments, submissions] = await Promise.all([
+    pool.query(`SELECT id, code, name, city, active, created_at FROM tenants ORDER BY created_at, id`),
+    pool.query(
+      `SELECT id, username, display_name, employee_no, password_plain, password_hash, role, tenant_id, active, created_at, updated_at
+       FROM users
+       ORDER BY role, created_at, id`
+    ),
+    pool.query(`SELECT id, tenant_id, type, value FROM lookups ORDER BY id`),
+    pool.query(`SELECT id, tenant_id, student_no, student_name, grade, section, active, created_at FROM students ORDER BY id`),
+    pool.query(`SELECT id, tenant_id, user_id, grade, section, subject FROM teacher_assignments ORDER BY id`),
+    pool.query(
+      `SELECT id, tenant_id, timestamp, batch_id, teacher_name, grade, section, subject, exam,
+              max_recall, max_understand, max_hots, total_max, student_name, recall, understand, hots, total, plan, level
+       FROM submissions
+       ORDER BY id`
+    )
+  ]);
+
+  return {
+    manifest: {
+      type: 'yubla_system_backup',
+      version: 1,
+      createdAt: new Date().toISOString(),
+      dbPath: DB_PATH
+    },
+    data: {
+      tenants: tenants.rows,
+      users: users.rows,
+      lookups: lookups.rows,
+      students: students.rows,
+      teacherAssignments: teacherAssignments.rows,
+      submissions: submissions.rows
+    },
+    counts: {
+      tenants: tenants.rowCount || 0,
+      users: users.rowCount || 0,
+      lookups: lookups.rowCount || 0,
+      students: students.rowCount || 0,
+      teacherAssignments: teacherAssignments.rowCount || 0,
+      submissions: submissions.rowCount || 0
+    }
+  };
+};
+
+export const restoreSystemBackupDb = async (backupPayload, { keepSessionId = null } = {}) => {
+  const data = normalizeBackupContainer(backupPayload);
+  const tenants = asArray(data.tenants);
+  const users = asArray(data.users);
+  const lookups = asArray(data.lookups);
+  const students = asArray(data.students);
+  const teacherAssignments = asArray(data.teacherAssignments);
+  const submissions = asArray(data.submissions);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (keepSessionId) {
+      await client.query('DELETE FROM sessions WHERE id <> $1', [keepSessionId]);
+    } else {
+      await client.query('DELETE FROM sessions');
+    }
+
+    await client.query('DELETE FROM submissions');
+    await client.query('DELETE FROM teacher_assignments');
+    await client.query('DELETE FROM students');
+    await client.query('DELETE FROM lookups');
+    await client.query("DELETE FROM users WHERE role <> 'super_admin'");
+    await client.query('DELETE FROM tenants');
+
+    for (const row of tenants) {
+      await client.query(
+        `INSERT INTO tenants (id, code, name, city, active, created_at)
+         VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamp, CURRENT_TIMESTAMP))`,
+        [
+          String(row?.id || '').trim(),
+          String(row?.code || '').trim(),
+          String(row?.name || '').trim(),
+          String(row?.city || ''),
+          Boolean(row?.active),
+          toTsOrNull(row?.created_at)
+        ]
+      );
+    }
+
+    const nonSuperUsers = users.filter((row) => String(row?.role || '').trim() !== 'super_admin');
+    for (const row of nonSuperUsers) {
+      await client.query(
+        `INSERT INTO users (
+            id, username, display_name, employee_no, password_plain, password_hash, role, tenant_id, active, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10::timestamp, CURRENT_TIMESTAMP), COALESCE($11::timestamp, CURRENT_TIMESTAMP)
+         )`,
+        [
+          String(row?.id || '').trim(),
+          String(row?.username || '').trim().toLowerCase(),
+          String(row?.display_name || ''),
+          String(row?.employee_no || ''),
+          String(row?.password_plain || ''),
+          String(row?.password_hash || ''),
+          String(row?.role || '').trim(),
+          row?.tenant_id ? String(row.tenant_id).trim() : null,
+          Boolean(row?.active),
+          toTsOrNull(row?.created_at),
+          toTsOrNull(row?.updated_at)
+        ]
+      );
+    }
+
+    for (const row of lookups) {
+      await client.query(
+        `INSERT INTO lookups (id, tenant_id, type, value)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          Number(row?.id || 0),
+          String(row?.tenant_id || '').trim(),
+          String(row?.type || '').trim(),
+          String(row?.value || '').trim()
+        ]
+      );
+    }
+
+    for (const row of students) {
+      await client.query(
+        `INSERT INTO students (id, tenant_id, student_no, student_name, grade, section, active, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamp, CURRENT_TIMESTAMP))
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          Number(row?.id || 0),
+          String(row?.tenant_id || '').trim(),
+          String(row?.student_no || ''),
+          String(row?.student_name || '').trim(),
+          String(row?.grade || '').trim(),
+          String(row?.section || '').trim(),
+          Boolean(row?.active),
+          toTsOrNull(row?.created_at)
+        ]
+      );
+    }
+
+    for (const row of teacherAssignments) {
+      await client.query(
+        `INSERT INTO teacher_assignments (id, tenant_id, user_id, grade, section, subject)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          Number(row?.id || 0),
+          String(row?.tenant_id || '').trim(),
+          String(row?.user_id || '').trim(),
+          String(row?.grade || '').trim(),
+          String(row?.section || '').trim(),
+          String(row?.subject || '').trim()
+        ]
+      );
+    }
+
+    for (const row of submissions) {
+      await client.query(
+        `INSERT INTO submissions (
+            id, tenant_id, timestamp, batch_id, teacher_name, grade, section, subject, exam,
+            max_recall, max_understand, max_hots, total_max, student_name, recall, understand, hots, total, plan, level
+         ) VALUES (
+            $1, $2, COALESCE($3::timestamp, CURRENT_TIMESTAMP), $4, $5, $6, $7, $8, $9,
+            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+         )
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          Number(row?.id || 0),
+          String(row?.tenant_id || '').trim(),
+          toTsOrNull(row?.timestamp),
+          String(row?.batch_id || '').trim(),
+          String(row?.teacher_name || '').trim(),
+          String(row?.grade || '').trim(),
+          String(row?.section || '').trim(),
+          String(row?.subject || '').trim(),
+          String(row?.exam || '').trim(),
+          Number(row?.max_recall || 0),
+          Number(row?.max_understand || 0),
+          Number(row?.max_hots || 0),
+          Number(row?.total_max || 0),
+          String(row?.student_name || '').trim(),
+          row?.recall === null || row?.recall === undefined || row?.recall === '' ? null : Number(row.recall),
+          row?.understand === null || row?.understand === undefined || row?.understand === '' ? null : Number(row.understand),
+          row?.hots === null || row?.hots === undefined || row?.hots === '' ? null : Number(row.hots),
+          row?.total === null || row?.total === undefined || row?.total === '' ? null : Number(row.total),
+          String(row?.plan || ''),
+          String(row?.level || '-')
+        ]
+      );
+    }
+
+    await resetSequence(client, 'lookups', 'lookups_id_seq');
+    await resetSequence(client, 'students', 'students_id_seq');
+    await resetSequence(client, 'teacher_assignments', 'teacher_assignments_id_seq');
+    await resetSequence(client, 'submissions', 'submissions_id_seq');
+
+    await client.query('COMMIT');
+
+    return {
+      tenants: tenants.length,
+      users: nonSuperUsers.length,
+      lookups: lookups.length,
+      students: students.length,
+      teacherAssignments: teacherAssignments.length,
+      submissions: submissions.length
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 // Export pool for cleanup
 export { pool };
 export const DB_PATH = 'PostgreSQL (Supabase)';
