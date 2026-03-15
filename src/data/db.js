@@ -275,6 +275,12 @@ const createSchema = async (client) => {
   await client.query('CREATE INDEX IF NOT EXISTS idx_users_tenant_role ON users (tenant_id, role)');
   await client.query('CREATE INDEX IF NOT EXISTS idx_students_tenant_grade_section ON students (tenant_id, grade, section)');
   await client.query('CREATE INDEX IF NOT EXISTS idx_submissions_tenant ON submissions (tenant_id)');
+  await client.query(
+    'CREATE INDEX IF NOT EXISTS idx_submissions_tenant_context_recent ON submissions (tenant_id, teacher_name, grade, section, subject, exam, id DESC)'
+  );
+  await client.query(
+    'CREATE INDEX IF NOT EXISTS idx_submissions_tenant_teacher_recent ON submissions (tenant_id, teacher_name, id DESC)'
+  );
   await client.query('CREATE INDEX IF NOT EXISTS idx_assignments_tenant_user ON teacher_assignments (tenant_id, user_id)');
 };
 
@@ -293,6 +299,12 @@ const applySchemaMigrations = async (client) => {
       ALTER COLUMN total DROP NOT NULL
   `);
   await client.query(`UPDATE submissions SET plan = '' WHERE plan IS NULL`);
+  await client.query(
+    'CREATE INDEX IF NOT EXISTS idx_submissions_tenant_context_recent ON submissions (tenant_id, teacher_name, grade, section, subject, exam, id DESC)'
+  );
+  await client.query(
+    'CREATE INDEX IF NOT EXISTS idx_submissions_tenant_teacher_recent ON submissions (tenant_id, teacher_name, id DESC)'
+  );
 };
 
 // Meta functions
@@ -1771,18 +1783,27 @@ export const dedupeSubmissionsDb = async ({ tenantId = null } = {}) => {
   };
 };
 
-export const getTenantSubmissionsDb = async (tenantId) => {
-  const result = await pool.query(
-    `SELECT timestamp, batch_id, teacher_name, grade, section, subject, exam,
-            max_recall, max_understand, max_hots, total_max,
-            student_name, recall, understand, hots, total, plan
-     FROM submissions
-     WHERE tenant_id = $1
-     ORDER BY id DESC`,
-    [tenantId]
-  );
+const buildSubmissionFiltersSql = (tenantId, filters = {}) => {
+  const where = ['tenant_id = $1'];
+  const params = [tenantId];
+  const addFilter = (fieldValue, columnName) => {
+    const value = cleanText(fieldValue);
+    if (!value) return;
+    params.push(value);
+    where.push(`${columnName} = $${params.length}`);
+  };
+  addFilter(filters.teacherName, 'teacher_name');
+  addFilter(filters.grade, 'grade');
+  addFilter(filters.section, 'section');
+  addFilter(filters.subject, 'subject');
+  addFilter(filters.exam, 'exam');
+  addFilter(filters.batchId, 'batch_id');
+  return { whereSql: where.join(' AND '), params };
+};
+
+const mapSubmissionRows = (rows = []) => {
   const markOrEmpty = (value) => (value === null || value === undefined ? '' : value);
-  return result.rows.map((row) => [
+  return rows.map((row) => [
     row.timestamp,
     row.batch_id,
     row.teacher_name,
@@ -1801,6 +1822,123 @@ export const getTenantSubmissionsDb = async (tenantId) => {
     markOrEmpty(row.total),
     row.plan ?? ''
   ]);
+};
+
+export const getTenantSubmissionsDb = async (tenantId, filters = {}) => {
+  const { whereSql, params } = buildSubmissionFiltersSql(tenantId, filters);
+  let query = `SELECT timestamp, batch_id, teacher_name, grade, section, subject, exam,
+            max_recall, max_understand, max_hots, total_max,
+            student_name, recall, understand, hots, total, plan
+     FROM submissions
+     WHERE ${whereSql}
+     ORDER BY id DESC`;
+  const safeLimit = Number.parseInt(filters.limit, 10);
+  const safeOffset = Number.parseInt(filters.offset, 10);
+  if (Number.isInteger(safeLimit) && safeLimit > 0) {
+    const boundedLimit = Math.min(20000, safeLimit);
+    params.push(boundedLimit);
+    query += ` LIMIT $${params.length}`;
+    if (Number.isInteger(safeOffset) && safeOffset >= 0) {
+      params.push(safeOffset);
+      query += ` OFFSET $${params.length}`;
+    }
+  }
+  const result = await pool.query(
+    query,
+    params
+  );
+  return mapSubmissionRows(result.rows);
+};
+
+export const getLatestSubmissionContextDb = async (tenantId, { teacherName = '' } = {}) => {
+  if (!tenantId) return null;
+  const filters = buildSubmissionFiltersSql(tenantId, { teacherName });
+  const result = await pool.query(
+    `SELECT timestamp, batch_id, teacher_name, grade, section, subject, exam,
+            max_recall, max_understand, max_hots, total_max
+     FROM submissions
+     WHERE ${filters.whereSql}
+     ORDER BY id DESC
+     LIMIT 1`,
+    filters.params
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    timestamp: row.timestamp,
+    batchId: row.batch_id,
+    teacherName: row.teacher_name,
+    grade: row.grade,
+    section: row.section,
+    subject: row.subject,
+    exam: row.exam,
+    maxRecall: row.max_recall,
+    maxUnderstand: row.max_understand,
+    maxHots: row.max_hots,
+    totalMax: row.total_max
+  };
+};
+
+export const getLatestSubmissionBatchForContextDb = async (tenantId, context = {}) => {
+  const teacherName = cleanText(context.teacherName);
+  const grade = cleanText(context.grade);
+  const section = cleanText(context.section);
+  const subject = cleanText(context.subject);
+  const exam = cleanText(context.exam);
+  if (!tenantId || !teacherName || !grade || !section || !subject || !exam) return null;
+
+  const latestResult = await pool.query(
+    `SELECT batch_id, timestamp, max_recall, max_understand, max_hots, total_max
+     FROM submissions
+     WHERE tenant_id = $1
+       AND teacher_name = $2
+       AND grade = $3
+       AND section = $4
+       AND subject = $5
+       AND exam = $6
+     ORDER BY id DESC
+     LIMIT 1`,
+    [tenantId, teacherName, grade, section, subject, exam]
+  );
+  const latestRow = latestResult.rows[0];
+  if (!latestRow) return null;
+
+  const batchRowsResult = await pool.query(
+    `SELECT student_name, recall, understand, hots, total, plan, level
+     FROM submissions
+     WHERE tenant_id = $1
+       AND teacher_name = $2
+       AND grade = $3
+       AND section = $4
+       AND subject = $5
+       AND exam = $6
+       AND batch_id = $7
+     ORDER BY student_name, id`,
+    [tenantId, teacherName, grade, section, subject, exam, latestRow.batch_id]
+  );
+  const rows = (batchRowsResult.rows || []).map((row) => ({
+    studentName: row.student_name,
+    recall: row.recall === null || row.recall === undefined ? '' : row.recall,
+    understand: row.understand === null || row.understand === undefined ? '' : row.understand,
+    hots: row.hots === null || row.hots === undefined ? '' : row.hots,
+    total: row.total === null || row.total === undefined ? '' : row.total,
+    plan: row.plan ?? '',
+    level: row.level ?? '-'
+  }));
+  return {
+    batchId: latestRow.batch_id,
+    timestamp: latestRow.timestamp,
+    teacherName,
+    grade,
+    section,
+    subject,
+    exam,
+    maxRecall: latestRow.max_recall,
+    maxUnderstand: latestRow.max_understand,
+    maxHots: latestRow.max_hots,
+    totalMax: latestRow.total_max,
+    rows
+  };
 };
 
 export const getSystemStatsDb = async () => {

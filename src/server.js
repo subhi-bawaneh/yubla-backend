@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import compression from 'compression';
 import cors from 'cors';
 import express from 'express';
 import apiRouter from './routes/api.js';
@@ -55,6 +56,7 @@ const jsonBodyLimit = String(process.env.JSON_BODY_LIMIT || '10mb').trim() || '1
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+app.use(compression());
 app.use(express.json({ limit: jsonBodyLimit }));
 
 app.get('/health', (_req, res) => {

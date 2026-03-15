@@ -17,6 +17,8 @@ import {
   findUserByUsernameDb,
   exportSystemBackupDb,
   getSystemStatsDb,
+  getLatestSubmissionBatchForContextDb,
+  getLatestSubmissionContextDb,
   getTeacherAssignmentsDb,
   getTenantAssignmentsDb,
   getTenantLookupsDb,
@@ -124,8 +126,24 @@ const getBearerToken = (req) => {
   return cookieToken || null;
 };
 
+const SESSION_CLEANUP_INTERVAL_MS = (() => {
+  const value = Number.parseInt(String(process.env.SESSION_CLEANUP_INTERVAL_MS || '60000'), 10);
+  return Number.isInteger(value) && value > 0 ? value : 60000;
+})();
+let nextSessionCleanupAt = 0;
+const maybeCleanupExpiredSessions = async () => {
+  const now = Date.now();
+  if (now < nextSessionCleanupAt) return;
+  nextSessionCleanupAt = now + SESSION_CLEANUP_INTERVAL_MS;
+  try {
+    await deleteExpiredSessionsDb();
+  } catch (error) {
+    console.warn('Failed to cleanup expired sessions:', error?.message || error);
+  }
+};
+
 const authRequired = async (req, res, next) => {
-  await deleteExpiredSessionsDb();
+  await maybeCleanupExpiredSessions();
   const token = getBearerToken(req);
   if (!token) {
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
@@ -658,6 +676,45 @@ router.get('/students', authRequired, rolesAllowed('school_admin', 'teacher', 's
   return res.json({ ok: true, students });
 });
 
+router.get('/teacher/table-snapshot', authRequired, rolesAllowed('teacher', 'super_admin'), async (req, res) => {
+  const grade = cleanText(req.query.grade);
+  const section = cleanText(req.query.section);
+  const subject = cleanText(req.query.subject);
+  const exam = cleanText(req.query.exam);
+  const tenantId = req.auth.role === 'super_admin' ? cleanText(req.query.tenantId) : req.auth.tenantId;
+  if (!grade || !section) {
+    return res.status(400).json({ ok: false, error: 'grade and section are required' });
+  }
+  if (req.auth.role === 'super_admin' && !tenantId) {
+    return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin' });
+  }
+
+  let teacherName = cleanText(req.query.teacherName);
+  if (req.auth.role === 'teacher') {
+    const authUser = await findUserByIdDb(req.auth.userId);
+    teacherName = cleanText(authUser?.displayName || authUser?.username || '');
+    const canAccess = subject
+      ? await canTeacherAccessDb(tenantId, req.auth.userId, grade, section, subject)
+      : await canTeacherAccessDb(tenantId, req.auth.userId, grade, section);
+    if (!canAccess) {
+      return res.status(403).json({ ok: false, error: 'Access denied for selected class/section/subject' });
+    }
+  }
+
+  const students = await getTenantStudentsDb(tenantId, grade, section);
+  let latestBatch = null;
+  if (teacherName && subject && exam) {
+    latestBatch = await getLatestSubmissionBatchForContextDb(tenantId, {
+      teacherName,
+      grade,
+      section,
+      subject,
+      exam
+    });
+  }
+  return res.json({ ok: true, students, latestBatch });
+});
+
 router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin'), async (req, res) => {
   const payload = req.body || {};
   const header = payload.header || {};
@@ -784,8 +841,77 @@ router.get('/submissions', authRequired, rolesAllowed('school_admin', 'teacher',
       return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin and edu_supervisor' });
     }
   }
-  const rows = await getTenantSubmissionsDb(tenantId);
+  const filters = {
+    teacherName: cleanText(req.query.teacherName),
+    grade: cleanText(req.query.grade),
+    section: cleanText(req.query.section),
+    subject: cleanText(req.query.subject),
+    exam: cleanText(req.query.exam),
+    batchId: cleanText(req.query.batchId),
+    limit: cleanText(req.query.limit),
+    offset: cleanText(req.query.offset)
+  };
+  if (req.auth.role === 'teacher') {
+    const authUser = await findUserByIdDb(req.auth.userId);
+    const teacherName = cleanText(authUser?.displayName || authUser?.username || '');
+    if (teacherName) filters.teacherName = teacherName;
+  }
+  const rows = await getTenantSubmissionsDb(tenantId, filters);
   return res.json({ ok: true, rows });
+});
+
+router.get('/submissions/latest-context', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin', 'edu_supervisor'), async (req, res) => {
+  let tenantId = req.auth.tenantId;
+  if (req.auth.role === 'super_admin' || req.auth.role === 'edu_supervisor') {
+    tenantId = cleanText(req.query.tenantId);
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin and edu_supervisor' });
+    }
+  }
+
+  let teacherName = cleanText(req.query.teacherName);
+  if (req.auth.role === 'teacher') {
+    const authUser = await findUserByIdDb(req.auth.userId);
+    teacherName = cleanText(authUser?.displayName || authUser?.username || '');
+  }
+  if (!teacherName) {
+    return res.status(400).json({ ok: false, error: 'teacherName is required' });
+  }
+
+  const latest = await getLatestSubmissionContextDb(tenantId, { teacherName });
+  return res.json({ ok: true, latest });
+});
+
+router.get('/submissions/context-latest', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin', 'edu_supervisor'), async (req, res) => {
+  let tenantId = req.auth.tenantId;
+  if (req.auth.role === 'super_admin' || req.auth.role === 'edu_supervisor') {
+    tenantId = cleanText(req.query.tenantId);
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin and edu_supervisor' });
+    }
+  }
+
+  let teacherName = cleanText(req.query.teacherName);
+  if (req.auth.role === 'teacher') {
+    const authUser = await findUserByIdDb(req.auth.userId);
+    teacherName = cleanText(authUser?.displayName || authUser?.username || '');
+  }
+  const grade = cleanText(req.query.grade);
+  const section = cleanText(req.query.section);
+  const subject = cleanText(req.query.subject);
+  const exam = cleanText(req.query.exam);
+  if (!teacherName || !grade || !section || !subject || !exam) {
+    return res.status(400).json({ ok: false, error: 'teacherName, grade, section, subject and exam are required' });
+  }
+
+  const latestBatch = await getLatestSubmissionBatchForContextDb(tenantId, {
+    teacherName,
+    grade,
+    section,
+    subject,
+    exam
+  });
+  return res.json({ ok: true, latestBatch });
 });
 
 export default router;
