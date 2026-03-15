@@ -80,7 +80,8 @@ const pool = new Pool({
 const SCHEMA_VERSION = '2026.02.platform.v1';
 const SEED_VERSION = '2026.03.empty.v3';
 
-const ROLE_VALUES = ['super_admin', 'school_admin', 'teacher'];
+const ROLE_VALUES = ['super_admin', 'school_admin', 'teacher', 'edu_supervisor'];
+const ROLES_WITHOUT_TENANT = new Set(['super_admin', 'edu_supervisor']);
 const GRADE_VALUES = ['سابع', 'ثامن', 'تاسع', 'عاشر', 'أول ثانوي', 'ثاني ثانوي'];
 const SECTION_VALUES = ['أ', 'ب', 'ج'];
 const SUBJECT_VALUES = [
@@ -191,7 +192,7 @@ const createSchema = async (client) => {
       employee_no TEXT NOT NULL DEFAULT '',
       password_plain TEXT NOT NULL DEFAULT '',
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('super_admin', 'school_admin', 'teacher')),
+      role TEXT NOT NULL CHECK (role IN ('super_admin', 'school_admin', 'teacher', 'edu_supervisor')),
       tenant_id TEXT NULL REFERENCES tenants(id),
       active BOOLEAN NOT NULL DEFAULT true,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -278,6 +279,12 @@ const createSchema = async (client) => {
 };
 
 const applySchemaMigrations = async (client) => {
+  await client.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check`);
+  await client.query(`
+    ALTER TABLE users
+    ADD CONSTRAINT users_role_check
+    CHECK (role IN ('super_admin', 'school_admin', 'teacher', 'edu_supervisor'))
+  `);
   await client.query(`
     ALTER TABLE submissions
       ALTER COLUMN recall DROP NOT NULL,
@@ -495,8 +502,9 @@ export const createUserDb = async ({
 
   if (!normalizedUsername || !passwordHash) return null;
   if (!ROLE_VALUES.includes(normalizedRole)) return null;
-  if (normalizedRole !== 'super_admin' && !tenantId) return null;
-  if (normalizedRole !== 'super_admin' && !(await findTenantByIdDb(tenantId))) return null;
+  const requiresTenant = !ROLES_WITHOUT_TENANT.has(normalizedRole);
+  if (requiresTenant && !tenantId) return null;
+  if (requiresTenant && !(await findTenantByIdDb(tenantId))) return null;
   if (await findUserByUsernameDb(normalizedUsername)) return null;
 
   const id = makeId('u');
@@ -513,7 +521,7 @@ export const createUserDb = async ({
         passwordHash,
         cleanText(passwordPlain),
         normalizedRole,
-        normalizedRole === 'super_admin' ? null : tenantId,
+        requiresTenant ? tenantId : null,
         active
       ]
     );
@@ -542,8 +550,9 @@ export const updateUserDb = async (userId, payload = {}) => {
   const nextActive = payload.active !== undefined ? Boolean(payload.active) : existing.active;
 
   if (!nextUsername || !nextPasswordHash || !ROLE_VALUES.includes(nextRole)) return null;
-  if (nextRole !== 'super_admin' && !nextTenantId) return null;
-  if (nextRole !== 'super_admin' && !(await findTenantByIdDb(nextTenantId))) return null;
+  const requiresTenant = !ROLES_WITHOUT_TENANT.has(nextRole);
+  if (requiresTenant && !nextTenantId) return null;
+  if (requiresTenant && !(await findTenantByIdDb(nextTenantId))) return null;
 
   const conflict = await pool.query('SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id <> $2', [nextUsername, userId]);
   if (conflict.rows[0]) return null;
@@ -559,7 +568,7 @@ export const updateUserDb = async (userId, payload = {}) => {
         nextPasswordHash,
         nextPasswordPlain,
         nextRole,
-        nextRole === 'super_admin' ? null : nextTenantId,
+        requiresTenant ? nextTenantId : null,
         nextActive,
         userId
       ]
@@ -846,7 +855,7 @@ export const purgeSchoolDataDb = async ({ keepSessionId = null, includeCounts = 
 
     await client.query('BEGIN');
     await client.query('TRUNCATE TABLE submissions, teacher_assignments, students, lookups RESTART IDENTITY');
-    await client.query("DELETE FROM users WHERE role <> 'super_admin'");
+    await client.query("DELETE FROM users WHERE role NOT IN ('super_admin', 'edu_supervisor')");
     await client.query('DELETE FROM tenants');
     if (keepSessionId) {
       await client.query('DELETE FROM sessions WHERE id <> $1', [keepSessionId]);
@@ -1905,7 +1914,7 @@ export const restoreSystemBackupDb = async (backupPayload, { keepSessionId = nul
     await client.query('DELETE FROM teacher_assignments');
     await client.query('DELETE FROM students');
     await client.query('DELETE FROM lookups');
-    await client.query("DELETE FROM users WHERE role <> 'super_admin'");
+    await client.query("DELETE FROM users WHERE role NOT IN ('super_admin', 'edu_supervisor')");
     await client.query('DELETE FROM tenants');
 
     for (const row of tenants) {

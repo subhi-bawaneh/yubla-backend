@@ -17,6 +17,7 @@ import {
   findUserByUsernameDb,
   exportSystemBackupDb,
   getSystemStatsDb,
+  getTeacherAssignmentsDb,
   getTenantAssignmentsDb,
   getTenantLookupsDb,
   getTenantStudentsDb,
@@ -330,6 +331,18 @@ router.get('/super/tenants', authRequired, rolesAllowed('super_admin'), async (r
   res.json({ ok: true, items, total, page, pageSize });
 });
 
+router.get('/supervisor/tenants', authRequired, rolesAllowed('edu_supervisor'), async (_req, res) => {
+  const items = (await listTenantsDb())
+    .filter((tenant) => tenant.active)
+    .map((tenant) => ({
+      id: tenant.id,
+      code: tenant.code,
+      name: tenant.name,
+      city: tenant.city || ''
+    }));
+  return res.json({ ok: true, items, total: items.length, page: 1, pageSize: items.length });
+});
+
 router.post('/super/tenants', authRequired, rolesAllowed('super_admin'), async (req, res) => {
   const code = cleanText(req.body?.code);
   const name = cleanText(req.body?.name);
@@ -397,11 +410,14 @@ router.post('/super/users', authRequired, rolesAllowed('super_admin'), async (re
     return res.status(400).json({ ok: false, error: 'username, password and role are required' });
   }
 
-  if (role !== 'super_admin') {
-    return res.status(400).json({ ok: false, error: 'Only platform admin accounts can be created manually' });
+  const isPlatformAccountRole = role === 'super_admin' || role === 'edu_supervisor';
+  if (!isPlatformAccountRole) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'Only platform admin or educational supervisor accounts can be created manually' });
   }
   if (tenantId) {
-    return res.status(400).json({ ok: false, error: 'tenantId is not allowed for platform admin accounts' });
+    return res.status(400).json({ ok: false, error: 'tenantId is not allowed for platform-level accounts' });
   }
 
   const user = await createUserDb({
@@ -444,6 +460,25 @@ router.get('/super/teachers', authRequired, rolesAllowed('super_admin'), async (
   const search = cleanText(req.query.search) || '';
   const teachers = await listTeachersForSuperDb({ tenantId, search });
   return res.json({ ok: true, teachers });
+});
+
+router.get('/super/teachers/:userId/assignments', authRequired, rolesAllowed('super_admin'), async (req, res) => {
+  const userId = cleanText(req.params.userId);
+  if (!userId) return res.status(400).json({ ok: false, error: 'userId is required' });
+  const teacher = await findUserByIdDb(userId);
+  if (!teacher || teacher.role !== 'teacher' || !teacher.tenantId) {
+    return res.status(404).json({ ok: false, error: 'Teacher not found' });
+  }
+  const assignments = await getTeacherAssignmentsDb(teacher.tenantId, teacher.id);
+  return res.json({
+    ok: true,
+    teacher: {
+      id: teacher.id,
+      tenantId: teacher.tenantId,
+      displayName: teacher.displayName || teacher.username || ''
+    },
+    assignments
+  });
 });
 
 router.delete('/super/teachers/:userId', authRequired, rolesAllowed('super_admin'), async (req, res) => {
@@ -584,9 +619,15 @@ router.post('/admin/students/replace', authRequired, rolesAllowed('school_admin'
   return res.json({ ok: true, replaced });
 });
 
-router.get('/lookups', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin'), async (req, res) => {
+router.get('/lookups', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin', 'edu_supervisor'), async (req, res) => {
   const user = await findUserByIdDb(req.auth.userId);
-  const tenantId = req.auth.role === 'super_admin' ? cleanText(req.query.tenantId) || null : req.auth.tenantId;
+  let tenantId = req.auth.tenantId;
+  if (req.auth.role === 'super_admin' || req.auth.role === 'edu_supervisor') {
+    tenantId = cleanText(req.query.tenantId) || null;
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin and edu_supervisor' });
+    }
+  }
   const lookups =
     req.auth.role === 'teacher'
       ? await buildTeacherScopedLookupsDb(tenantId, user)
@@ -595,23 +636,33 @@ router.get('/lookups', authRequired, rolesAllowed('school_admin', 'teacher', 'su
   return res.json({ ok: true, ...lookups });
 });
 
-router.get('/students', authRequired, rolesAllowed('school_admin', 'teacher'), async (req, res) => {
+router.get('/teacher/assignments', authRequired, rolesAllowed('teacher'), async (req, res) => {
+  const assignments = await getTeacherAssignmentsDb(req.auth.tenantId, req.auth.userId);
+  return res.json({ ok: true, assignments });
+});
+
+router.get('/students', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin'), async (req, res) => {
   const grade = cleanText(req.query.grade);
   const section = cleanText(req.query.section);
+  const tenantId = req.auth.role === 'super_admin' ? cleanText(req.query.tenantId) : req.auth.tenantId;
   if (!grade || !section) {
     return res.status(400).json({ ok: false, error: 'grade and section are required' });
   }
-  if (req.auth.role === 'teacher' && !(await canTeacherAccessDb(req.auth.tenantId, req.auth.userId, grade, section))) {
+  if (req.auth.role === 'super_admin' && !tenantId) {
+    return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin' });
+  }
+  if (req.auth.role === 'teacher' && !(await canTeacherAccessDb(tenantId, req.auth.userId, grade, section))) {
     return res.status(403).json({ ok: false, error: 'Access denied for selected class/section' });
   }
-  const students = await getTenantStudentsDb(req.auth.tenantId, grade, section);
+  const students = await getTenantStudentsDb(tenantId, grade, section);
   return res.json({ ok: true, students });
 });
 
-router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'), async (req, res) => {
+router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin'), async (req, res) => {
   const payload = req.body || {};
   const header = payload.header || {};
   const rows = Array.isArray(payload.rows) ? payload.rows : [];
+  const tenantId = req.auth.role === 'super_admin' ? cleanText(req.query.tenantId || payload.tenantId) : req.auth.tenantId;
   if (!rows.length) return res.status(400).json({ ok: false, error: 'rows are required' });
 
   const grade = cleanText(header.grade);
@@ -634,15 +685,18 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
   if (!grade || !section || !subject || !exam) {
     return res.status(400).json({ ok: false, error: 'grade, section, subject and exam are required' });
   }
+  if (req.auth.role === 'super_admin' && !tenantId) {
+    return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin' });
+  }
   for (const [field, value] of maxFields) {
     if (!Number.isInteger(value) || value < 0) {
       return res.status(400).json({ ok: false, error: `${field} must be an integer >= 0` });
     }
   }
-  if (req.auth.role === 'school_admin' && !teacherNameInput) {
-    return res.status(400).json({ ok: false, error: 'teacherName is required for school_admin submissions' });
+  if ((req.auth.role === 'school_admin' || req.auth.role === 'super_admin') && !teacherNameInput) {
+    return res.status(400).json({ ok: false, error: 'teacherName is required for school_admin and super_admin submissions' });
   }
-  if (req.auth.role === 'teacher' && !(await canTeacherAccessDb(req.auth.tenantId, req.auth.userId, grade, section, subject))) {
+  if (req.auth.role === 'teacher' && !(await canTeacherAccessDb(tenantId, req.auth.userId, grade, section, subject))) {
     return res.status(403).json({ ok: false, error: 'Access denied for selected grade/section/subject' });
   }
 
@@ -715,19 +769,19 @@ router.post('/submissions', authRequired, rolesAllowed('school_admin', 'teacher'
   }
 
   const inserted = await replaceTenantSubmissionsBatchDb(
-    req.auth.tenantId,
+    tenantId,
     { teacherName, grade, section, subject, exam },
     insertRows
   );
   return res.json({ ok: true, batchId, inserted });
 });
 
-router.get('/submissions', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin'), async (req, res) => {
+router.get('/submissions', authRequired, rolesAllowed('school_admin', 'teacher', 'super_admin', 'edu_supervisor'), async (req, res) => {
   let tenantId = req.auth.tenantId;
-  if (req.auth.role === 'super_admin') {
+  if (req.auth.role === 'super_admin' || req.auth.role === 'edu_supervisor') {
     tenantId = cleanText(req.query.tenantId);
     if (!tenantId) {
-      return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin' });
+      return res.status(400).json({ ok: false, error: 'tenantId is required for super_admin and edu_supervisor' });
     }
   }
   const rows = await getTenantSubmissionsDb(tenantId);
